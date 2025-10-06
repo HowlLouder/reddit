@@ -53,6 +53,25 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+@app.route('/init-db')
+def init_db():
+    """Initialize database tables - run this once after deployment"""
+    try:
+        db.create_all()
+        # Create default admin user if it doesn't exist
+        if not User.query.filter_by(username='admin').first():
+            admin = User(
+                username='admin',
+                email='admin@example.com',
+                password_hash=generate_password_hash('admin123'),
+                is_admin=True
+            )
+            db.session.add(admin)
+            db.session.commit()
+        return "Database initialized successfully! You can now register and login."
+    except Exception as e:
+        return f"Error initializing database: {str(e)}"
+
 @app.route('/')
 def index():
     if 'user_id' in session:
