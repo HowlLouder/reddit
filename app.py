@@ -187,6 +187,26 @@ def init_db():
     except Exception as e:
         return f"Error initializing database: {str(e)}"
 
+@app.route('/reset-db')
+def reset_db():
+    """Drop all tables and recreate them - WARNING: deletes all data"""
+    try:
+        db.drop_all()
+        db.create_all()
+        # Create default admin user
+        if not User.query.filter_by(username='admin').first():
+            admin = User(
+                username='admin',
+                email='admin@example.com',
+                password_hash=generate_password_hash('admin123'),
+                is_admin=True
+            )
+            db.session.add(admin)
+            db.session.commit()
+        return "Database reset successfully! All tables recreated. You need to register again."
+    except Exception as e:
+        return f"Error resetting database: {str(e)}"
+
 @app.route('/')
 def index():
     if 'user_id' in session:
@@ -270,42 +290,45 @@ def dashboard():
         <a href="/logout">Logout</a> | <a href="/create-scrape">Create New Scrape</a>
         
         <h2>Your Scrapes</h2>
-        <table border="1">
-            <tr>
-                <th>Name</th>
-                <th>Subreddits</th>
-                <th>Keywords</th>
-                <th>Status</th>
-                <th>Last Run</th>
-                <th>Results</th>
-                <th>Actions</th>
+        <table border="1" style="width:100%; border-collapse: collapse;">
+            <tr style="background-color: #f2f2f2;">
+                <th style="padding: 8px;">Name</th>
+                <th style="padding: 8px;">Subreddits</th>
+                <th style="padding: 8px;">Keywords</th>
+                <th style="padding: 8px;">Status</th>
+                <th style="padding: 8px;">Last Run</th>
+                <th style="padding: 8px;">Results</th>
+                <th style="padding: 8px;">Actions</th>
             </tr>
     '''
     
     for scrape in scrapes:
         result_count = Result.query.filter_by(scrape_id=scrape.id).count()
-        status = "Active" if scrape.is_active else "Paused"
+        status = "✅ Active" if scrape.is_active else "⏸️ Paused"
         last_run = scrape.last_run.strftime('%Y-%m-%d %H:%M') if scrape.last_run else 'Never'
         
         html += f'''
             <tr>
-                <td>{scrape.name}</td>
-                <td>{scrape.subreddits}</td>
-                <td>{scrape.keywords}</td>
-                <td>{status}</td>
-                <td>{last_run}</td>
-                <td><a href="/results/{scrape.id}">{result_count} results</a></td>
-                <td>
-                    <a href="/run-scrape/{scrape.id}">Run Now</a> | 
-                    <a href="/toggle-scrape/{scrape.id}">Toggle</a> |
-                    <a href="/delete-scrape/{scrape.id}">Delete</a>
+                <td style="padding: 8px;">{scrape.name}</td>
+                <td style="padding: 8px;">{scrape.subreddits}</td>
+                <td style="padding: 8px;">{scrape.keywords}</td>
+                <td style="padding: 8px;">{status}</td>
+                <td style="padding: 8px;">{last_run}</td>
+                <td style="padding: 8px;"><a href="/results/{scrape.id}">{result_count} results</a></td>
+                <td style="padding: 8px;">
+                    <a href="/run-scrape/{scrape.id}">▶️ Run Now</a> | 
+                    <a href="/toggle-scrape/{scrape.id}">⏯️ Toggle</a> |
+                    <a href="/delete-scrape/{scrape.id}" onclick="return confirm('Delete this scrape?')">🗑️ Delete</a>
                 </td>
             </tr>
         '''
     
+    if not scrapes:
+        html += '<tr><td colspan="7" style="padding: 20px; text-align: center;">No scrapes yet. Create your first one!</td></tr>'
+    
     html += '''
         </table>
-        <p><small>Scrapes run automatically every hour</small></p>
+        <p><small>ℹ️ Scrapes run automatically every hour</small></p>
     '''
     
     return html
@@ -329,22 +352,23 @@ def create_scrape():
     
     return '''
         <h2>Create New Scrape</h2>
-        <form method="POST">
-            <label>Name:</label><br>
-            <input type="text" name="name" required><br><br>
+        <form method="POST" style="max-width: 500px;">
+            <label><b>Name:</b></label><br>
+            <input type="text" name="name" style="width: 100%; padding: 8px; margin: 5px 0 15px 0;" required><br>
             
-            <label>Subreddits (comma-separated):</label><br>
-            <input type="text" name="subreddits" placeholder="python,learnprogramming,coding" required><br><br>
+            <label><b>Subreddits (comma-separated):</b></label><br>
+            <input type="text" name="subreddits" placeholder="python,learnprogramming,coding" style="width: 100%; padding: 8px; margin: 5px 0 15px 0;" required><br>
             
-            <label>Keywords (comma-separated):</label><br>
-            <input type="text" name="keywords" placeholder="beginner,tutorial,help" required><br><br>
+            <label><b>Keywords (comma-separated):</b></label><br>
+            <input type="text" name="keywords" placeholder="beginner,tutorial,help" style="width: 100%; padding: 8px; margin: 5px 0 15px 0;" required><br>
             
-            <label>Posts to check per subreddit:</label><br>
-            <input type="number" name="limit" value="50"><br><br>
+            <label><b>Posts to check per subreddit:</b></label><br>
+            <input type="number" name="limit" value="50" style="width: 100%; padding: 8px; margin: 5px 0 15px 0;"><br>
             
-            <button type="submit">Create Scrape</button>
+            <button type="submit" style="padding: 10px 20px; background: #4CAF50; color: white; border: none; cursor: pointer;">Create Scrape</button>
         </form>
-        <a href="/dashboard">Back to Dashboard</a>
+        <br>
+        <a href="/dashboard">← Back to Dashboard</a>
     '''
 
 @app.route('/results/<int:scrape_id>')
@@ -360,33 +384,36 @@ def view_results(scrape_id):
     
     html = f'''
         <h1>Results for: {scrape.name}</h1>
-        <a href="/dashboard">Back to Dashboard</a>
+        <a href="/dashboard">← Back to Dashboard</a>
         
         <h2>Found {len(results)} matching posts</h2>
-        <table border="1">
-            <tr>
-                <th>Date</th>
-                <th>Subreddit</th>
-                <th>Title</th>
-                <th>Author</th>
-                <th>Score</th>
-                <th>Keywords</th>
-                <th>Link</th>
+        <table border="1" style="width:100%; border-collapse: collapse;">
+            <tr style="background-color: #f2f2f2;">
+                <th style="padding: 8px;">Date</th>
+                <th style="padding: 8px;">Subreddit</th>
+                <th style="padding: 8px;">Title</th>
+                <th style="padding: 8px;">Author</th>
+                <th style="padding: 8px;">Score</th>
+                <th style="padding: 8px;">Keywords</th>
+                <th style="padding: 8px;">Link</th>
             </tr>
     '''
     
     for result in results:
         html += f'''
             <tr>
-                <td>{result.created_at.strftime('%Y-%m-%d %H:%M')}</td>
-                <td>r/{result.subreddit}</td>
-                <td>{result.title[:100]}</td>
-                <td>{result.author}</td>
-                <td>{result.score}</td>
-                <td>{result.keywords_found}</td>
-                <td><a href="{result.url}" target="_blank">View</a></td>
+                <td style="padding: 8px;">{result.created_at.strftime('%Y-%m-%d %H:%M')}</td>
+                <td style="padding: 8px;">r/{result.subreddit}</td>
+                <td style="padding: 8px;">{result.title[:100]}...</td>
+                <td style="padding: 8px;">u/{result.author}</td>
+                <td style="padding: 8px;">{result.score}</td>
+                <td style="padding: 8px;">{result.keywords_found}</td>
+                <td style="padding: 8px;"><a href="{result.url}" target="_blank">🔗 View on Reddit</a></td>
             </tr>
         '''
+    
+    if not results:
+        html += '<tr><td colspan="7" style="padding: 20px; text-align: center;">No results yet. Run the scrape to find matching posts!</td></tr>'
     
     html += '</table>'
     return html
