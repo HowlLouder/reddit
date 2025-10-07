@@ -8,7 +8,6 @@ from functools import wraps
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 import os
-from openai import OpenAI
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-' + str(os.urandom(24).hex()))
@@ -19,10 +18,6 @@ db = SQLAlchemy(app)
 # Configuration from environment variables
 GHL_API_KEY = os.environ.get('GHL_API_KEY', '')
 GHL_LOCATION_ID = os.environ.get('GHL_LOCATION_ID', '')
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
-
-# Initialize OpenAI client
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # Database Models
 class User(db.Model):
@@ -54,8 +49,6 @@ class Result(db.Model):
     score = db.Column(db.Integer)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     keywords_found = db.Column(db.Text)
-    ai_score = db.Column(db.Integer)  # 1-10 quality score
-    ai_reasoning = db.Column(db.Text)  # Why the AI scored it this way
 
 def get_reddit_instance():
     return praw.Reddit(
@@ -72,68 +65,9 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-def analyze_post_with_ai(title, text, keywords, subreddit):
-    """Use AI to analyze if a post is a real opportunity"""
-    if not openai_client:
-        return 5, "AI not configured"
-    
-    try:
-        prompt = f"""Analyze this Reddit post to determine if it's a genuine business opportunity for someone offering services related to these keywords: {keywords}
-
-Subreddit: r/{subreddit}
-Title: {title}
-Content: {text[:500]}
-
-Is this person:
-1. Expressing a need or pain point?
-2. Asking for help or recommendations?
-3. A potential customer for {keywords} services?
-
-Or are they just casually mentioning these keywords?
-
-Respond with:
-Score: [1-10, where 10 is definitely a sales opportunity]
-Reason: [Brief explanation in one sentence]
-
-Format: Score: X | Reason: [explanation]"""
-
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a lead qualification expert. Analyze Reddit posts to identify genuine business opportunities."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=150,
-            temperature=0.3
-        )
-        
-        result = response.choices[0].message.content.strip()
-        
-        # Parse the response
-        if "Score:" in result and "Reason:" in result:
-            score_part = result.split("Reason:")[0].replace("Score:", "").strip()
-            reason_part = result.split("Reason:")[1].strip()
-            
-            # Extract numeric score
-            score = int(''.join(filter(str.isdigit, score_part.split()[0])))
-            score = max(1, min(10, score))  # Ensure 1-10 range
-            
-            return score, reason_part
-        else:
-            return 5, result[:200]
-            
-    except Exception as e:
-        print(f"AI analysis error: {e}")
-        return 5, f"Analysis error: {str(e)[:100]}"
-
 def send_to_ghl(result_data):
-    """Send scraped result to GoHighLevel as a contact - only if AI verified"""
+    """Send scraped result to GoHighLevel as a contact"""
     if not GHL_API_KEY or not GHL_LOCATION_ID:
-        return False
-    
-    # Only send if AI score is 7 or higher
-    if result_data.get('ai_score', 0) < 7:
-        print(f"Skipping GHL - AI score too low: {result_data.get('ai_score')}")
         return False
     
     try:
@@ -150,9 +84,7 @@ def send_to_ghl(result_data):
             'customFields': {
                 'reddit_post_url': result_data.get('url', ''),
                 'reddit_title': result_data.get('title', ''),
-                'subreddit': result_data.get('subreddit', ''),
-                'ai_score': str(result_data.get('ai_score', 0)),
-                'ai_reasoning': result_data.get('ai_reasoning', '')
+                'subreddit': result_data.get('subreddit', '')
             }
         }
         
@@ -197,14 +129,6 @@ def run_scrape(scrape_id):
                             ).first()
                             
                             if not existing:
-                                # Analyze with AI
-                                ai_score, ai_reasoning = analyze_post_with_ai(
-                                    post.title,
-                                    post.selftext,
-                                    ', '.join(found_keywords),
-                                    subreddit_name
-                                )
-                                
                                 result = Result(
                                     scrape_id=scrape.id,
                                     title=post.title,
@@ -212,22 +136,18 @@ def run_scrape(scrape_id):
                                     subreddit=subreddit_name,
                                     url=f"https://reddit.com{post.permalink}",
                                     score=post.score,
-                                    keywords_found=','.join(found_keywords),
-                                    ai_score=ai_score,
-                                    ai_reasoning=ai_reasoning
+                                    keywords_found=','.join(found_keywords)
                                 )
                                 db.session.add(result)
                                 results_count += 1
                                 
-                                # Send to GHL only if AI verified (7+)
+                                # Send to GHL
                                 send_to_ghl({
                                     'author': str(post.author),
                                     'url': f"https://reddit.com{post.permalink}",
                                     'title': post.title,
                                     'subreddit': subreddit_name,
-                                    'keywords_found': found_keywords,
-                                    'ai_score': ai_score,
-                                    'ai_reasoning': ai_reasoning
+                                    'keywords_found': found_keywords
                                 })
                 
                 except Exception as e:
@@ -384,7 +304,6 @@ def dashboard():
     
     for scrape in scrapes:
         result_count = Result.query.filter_by(scrape_id=scrape.id).count()
-        verified_count = Result.query.filter_by(scrape_id=scrape.id).filter(Result.ai_score >= 7).count()
         status = "✅ Active" if scrape.is_active else "⏸️ Paused"
         last_run = scrape.last_run.strftime('%Y-%m-%d %H:%M') if scrape.last_run else 'Never'
         
@@ -395,7 +314,7 @@ def dashboard():
                 <td style="padding: 8px;">{scrape.keywords}</td>
                 <td style="padding: 8px;">{status}</td>
                 <td style="padding: 8px;">{last_run}</td>
-                <td style="padding: 8px;"><a href="/results/{scrape.id}">{result_count} total ({verified_count} verified)</a></td>
+                <td style="padding: 8px;"><a href="/results/{scrape.id}">{result_count} results</a></td>
                 <td style="padding: 8px;">
                     <a href="/run-scrape/{scrape.id}">▶️ Run Now</a> | 
                     <a href="/toggle-scrape/{scrape.id}">⏯️ Toggle</a> |
@@ -409,7 +328,7 @@ def dashboard():
     
     html += '''
         </table>
-        <p><small>ℹ️ Scrapes run automatically every hour. Only AI-verified leads (score 7+) are sent to GoHighLevel.</small></p>
+        <p><small>ℹ️ Scrapes run automatically every hour. All results are sent to GoHighLevel.</small></p>
     '''
     
     return html
@@ -461,82 +380,40 @@ def view_results(scrape_id):
         flash('Access denied')
         return redirect(url_for('dashboard'))
     
-    # Get filter parameter
-    verified_only = request.args.get('verified', 'true').lower() == 'true'
-    
-    # Query results based on filter
-    query = Result.query.filter_by(scrape_id=scrape_id)
-    if verified_only:
-        query = query.filter(Result.ai_score >= 7)
-    results = query.order_by(Result.created_at.desc()).all()
-    
-    # Get counts
-    total_count = Result.query.filter_by(scrape_id=scrape_id).count()
-    verified_count = Result.query.filter_by(scrape_id=scrape_id).filter(Result.ai_score >= 7).count()
-    
-    # Toggle button
-    toggle_url = f"/results/{scrape_id}?verified={'false' if verified_only else 'true'}"
-    current_filter = "AI Verified Only (7+)" if verified_only else "Show All"
-    toggle_text = "Show All" if verified_only else "AI Verified Only"
+    results = Result.query.filter_by(scrape_id=scrape_id).order_by(Result.created_at.desc()).all()
     
     html = f'''
         <h1>Results for: {scrape.name}</h1>
         <a href="/dashboard">← Back to Dashboard</a>
         
-        <div style="margin: 20px 0;">
-            <b>Filter:</b> {current_filter} | 
-            <a href="{toggle_url}" style="padding: 5px 15px; background: #2196F3; color: white; text-decoration: none; border-radius: 3px;">
-                {toggle_text}
-            </a>
-        </div>
-        
-        <p><b>Showing {len(results)} of {total_count} posts</b> ({verified_count} verified by AI)</p>
-        
+        <h2>Found {len(results)} matching posts</h2>
         <table border="1" style="width:100%; border-collapse: collapse;">
             <tr style="background-color: #f2f2f2;">
-                <th style="padding: 8px;">AI Score</th>
                 <th style="padding: 8px;">Date</th>
                 <th style="padding: 8px;">Subreddit</th>
                 <th style="padding: 8px;">Title</th>
                 <th style="padding: 8px;">Author</th>
                 <th style="padding: 8px;">Upvotes</th>
                 <th style="padding: 8px;">Keywords</th>
-                <th style="padding: 8px;">AI Reasoning</th>
                 <th style="padding: 8px;">Link</th>
             </tr>
     '''
     
     for result in results:
-        # Color code based on AI score
-        if result.ai_score >= 8:
-            score_color = "#4CAF50"  # Green
-            score_emoji = "✅"
-        elif result.ai_score >= 6:
-            score_color = "#FF9800"  # Orange
-            score_emoji = "⚠️"
-        else:
-            score_color = "#f44336"  # Red
-            score_emoji = "❌"
-        
         html += f'''
             <tr>
-                <td style="padding: 8px; text-align: center; background-color: {score_color}; color: white; font-weight: bold;">
-                    {score_emoji} {result.ai_score}/10
-                </td>
                 <td style="padding: 8px;">{result.created_at.strftime('%Y-%m-%d %H:%M')}</td>
                 <td style="padding: 8px;">r/{result.subreddit}</td>
                 <td style="padding: 8px;">{result.title[:80]}...</td>
                 <td style="padding: 8px;">u/{result.author}</td>
                 <td style="padding: 8px;">{result.score}</td>
                 <td style="padding: 8px;">{result.keywords_found}</td>
-                <td style="padding: 8px;"><i>{result.ai_reasoning}</i></td>
-                <td style="padding: 8px;"><a href="{result.url}" target="_blank">🔗 View</a></td>
+                <td style="padding: 8px;"><a href="{result.url}" target="_blank">🔗 View on Reddit</a></td>
             </tr>
         '''
     
     if not results:
-        filter_msg = "No AI-verified results yet. Try 'Show All' to see unverified posts." if verified_only else "No results yet. Run the scrape to find matching posts!"
-        html += f'<tr><td colspan="9" style="padding: 20px; text-align: center;">{filter_msg}</td></tr>'
+        html += '<tr><td colspan="7" style="padding: 20px; text-align: center;">No results yet. Run the scrape to find matching posts!</td></tr>'
     
     html += '</table>'
     return html
