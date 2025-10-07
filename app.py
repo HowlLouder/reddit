@@ -37,11 +37,23 @@ class Scrape(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_run = db.Column(db.DateTime)
+    is_active = db.Column(db.Boolean, default=True)
+
+class Result(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    scrape_id = db.Column(db.Integer, db.ForeignKey('scrape.id'), nullable=False)
+    title = db.Column(db.Text, nullable=False)
+    author = db.Column(db.String(100))
+    subreddit = db.Column(db.String(100))
+    url = db.Column(db.Text)
+    score = db.Column(db.Integer)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    keywords_found = db.Column(db.Text)
 
 def get_reddit_instance():
     return praw.Reddit(
-        client_id=os.environ.get('REDDIT_CLIENT_ID', 'YOUR_CLIENT_ID'),
-        client_secret=os.environ.get('REDDIT_CLIENT_SECRET', 'YOUR_CLIENT_SECRET'),
+        client_id=os.environ.get('REDDIT_CLIENT_ID', ''),
+        client_secret=os.environ.get('REDDIT_CLIENT_SECRET', ''),
         user_agent="scraper_platform"
     )
 
@@ -53,12 +65,115 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def send_to_ghl(result_data):
+    """Send scraped result to GoHighLevel as a contact"""
+    if not GHL_API_KEY or not GHL_LOCATION_ID:
+        return False
+    
+    try:
+        headers = {
+            'Authorization': f'Bearer {GHL_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+        
+        contact_data = {
+            'locationId': GHL_LOCATION_ID,
+            'firstName': result_data.get('author', 'Reddit User'),
+            'source': 'Reddit Scraper',
+            'tags': result_data.get('keywords_found', []),
+            'customFields': {
+                'reddit_post_url': result_data.get('url', ''),
+                'reddit_title': result_data.get('title', ''),
+                'subreddit': result_data.get('subreddit', '')
+            }
+        }
+        
+        response = requests.post(
+            'https://rest.gohighlevel.com/v1/contacts/',
+            headers=headers,
+            json=contact_data
+        )
+        return response.status_code == 200
+    except Exception as e:
+        print(f"Error sending to GHL: {e}")
+        return False
+
+def run_scrape(scrape_id):
+    """Execute a scraping job"""
+    with app.app_context():
+        scrape = Scrape.query.get(scrape_id)
+        if not scrape or not scrape.is_active:
+            return
+        
+        try:
+            reddit = get_reddit_instance()
+            subreddit_list = [s.strip() for s in scrape.subreddits.split(',')]
+            keyword_list = [k.strip().lower() for k in scrape.keywords.split(',')]
+            
+            results_count = 0
+            
+            for subreddit_name in subreddit_list:
+                try:
+                    subreddit = reddit.subreddit(subreddit_name)
+                    
+                    for post in subreddit.new(limit=scrape.limit):
+                        post_text = f"{post.title} {post.selftext}".lower()
+                        
+                        found_keywords = [kw for kw in keyword_list if kw in post_text]
+                        
+                        if found_keywords:
+                            # Check if we already have this result
+                            existing = Result.query.filter_by(
+                                scrape_id=scrape.id,
+                                url=f"https://reddit.com{post.permalink}"
+                            ).first()
+                            
+                            if not existing:
+                                result = Result(
+                                    scrape_id=scrape.id,
+                                    title=post.title,
+                                    author=str(post.author),
+                                    subreddit=subreddit_name,
+                                    url=f"https://reddit.com{post.permalink}",
+                                    score=post.score,
+                                    keywords_found=','.join(found_keywords)
+                                )
+                                db.session.add(result)
+                                results_count += 1
+                                
+                                # Send to GHL if configured
+                                send_to_ghl({
+                                    'author': str(post.author),
+                                    'url': f"https://reddit.com{post.permalink}",
+                                    'title': post.title,
+                                    'subreddit': subreddit_name,
+                                    'keywords_found': found_keywords
+                                })
+                
+                except Exception as e:
+                    print(f"Error scraping r/{subreddit_name}: {e}")
+                    continue
+            
+            scrape.last_run = datetime.utcnow()
+            db.session.commit()
+            print(f"Scrape {scrape.id} completed. Found {results_count} new results.")
+            
+        except Exception as e:
+            print(f"Error running scrape {scrape_id}: {e}")
+            db.session.rollback()
+
+def run_all_scrapes():
+    """Run all active scrapes"""
+    with app.app_context():
+        scrapes = Scrape.query.filter_by(is_active=True).all()
+        for scrape in scrapes:
+            run_scrape(scrape.id)
+
 @app.route('/init-db')
 def init_db():
     """Initialize database tables - run this once after deployment"""
     try:
         db.create_all()
-        # Create default admin user if it doesn't exist
         if not User.query.filter_by(username='admin').first():
             admin = User(
                 username='admin',
@@ -76,7 +191,11 @@ def init_db():
 def index():
     if 'user_id' in session:
         return redirect(url_for('dashboard'))
-    return '<h1>Reddit Scraper Platform</h1><a href="/login">Login</a> | <a href="/register">Register</a>'
+    return '''
+        <h1>Reddit Scraper Platform</h1>
+        <p>Automatically monitor Reddit for keywords and send leads to GoHighLevel</p>
+        <a href="/login">Login</a> | <a href="/register">Register</a>
+    '''
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
@@ -145,7 +264,182 @@ def logout():
 @login_required
 def dashboard():
     scrapes = Scrape.query.filter_by(user_id=session['user_id']).all()
-    return f'<h1>Welcome {session["username"]}!</h1><a href="/logout">Logout</a><p>Dashboard working!</p>'
+    
+    html = f'''
+        <h1>Welcome {session["username"]}!</h1>
+        <a href="/logout">Logout</a> | <a href="/create-scrape">Create New Scrape</a>
+        
+        <h2>Your Scrapes</h2>
+        <table border="1">
+            <tr>
+                <th>Name</th>
+                <th>Subreddits</th>
+                <th>Keywords</th>
+                <th>Status</th>
+                <th>Last Run</th>
+                <th>Results</th>
+                <th>Actions</th>
+            </tr>
+    '''
+    
+    for scrape in scrapes:
+        result_count = Result.query.filter_by(scrape_id=scrape.id).count()
+        status = "Active" if scrape.is_active else "Paused"
+        last_run = scrape.last_run.strftime('%Y-%m-%d %H:%M') if scrape.last_run else 'Never'
+        
+        html += f'''
+            <tr>
+                <td>{scrape.name}</td>
+                <td>{scrape.subreddits}</td>
+                <td>{scrape.keywords}</td>
+                <td>{status}</td>
+                <td>{last_run}</td>
+                <td><a href="/results/{scrape.id}">{result_count} results</a></td>
+                <td>
+                    <a href="/run-scrape/{scrape.id}">Run Now</a> | 
+                    <a href="/toggle-scrape/{scrape.id}">Toggle</a> |
+                    <a href="/delete-scrape/{scrape.id}">Delete</a>
+                </td>
+            </tr>
+        '''
+    
+    html += '''
+        </table>
+        <p><small>Scrapes run automatically every hour</small></p>
+    '''
+    
+    return html
+
+@app.route('/create-scrape', methods=['GET', 'POST'])
+@login_required
+def create_scrape():
+    if request.method == 'POST':
+        scrape = Scrape(
+            name=request.form['name'],
+            subreddits=request.form['subreddits'],
+            keywords=request.form['keywords'],
+            limit=int(request.form.get('limit', 50)),
+            user_id=session['user_id']
+        )
+        db.session.add(scrape)
+        db.session.commit()
+        
+        flash('Scrape created! It will run automatically every hour.')
+        return redirect(url_for('dashboard'))
+    
+    return '''
+        <h2>Create New Scrape</h2>
+        <form method="POST">
+            <label>Name:</label><br>
+            <input type="text" name="name" required><br><br>
+            
+            <label>Subreddits (comma-separated):</label><br>
+            <input type="text" name="subreddits" placeholder="python,learnprogramming,coding" required><br><br>
+            
+            <label>Keywords (comma-separated):</label><br>
+            <input type="text" name="keywords" placeholder="beginner,tutorial,help" required><br><br>
+            
+            <label>Posts to check per subreddit:</label><br>
+            <input type="number" name="limit" value="50"><br><br>
+            
+            <button type="submit">Create Scrape</button>
+        </form>
+        <a href="/dashboard">Back to Dashboard</a>
+    '''
+
+@app.route('/results/<int:scrape_id>')
+@login_required
+def view_results(scrape_id):
+    scrape = Scrape.query.get_or_404(scrape_id)
+    
+    if scrape.user_id != session['user_id']:
+        flash('Access denied')
+        return redirect(url_for('dashboard'))
+    
+    results = Result.query.filter_by(scrape_id=scrape_id).order_by(Result.created_at.desc()).all()
+    
+    html = f'''
+        <h1>Results for: {scrape.name}</h1>
+        <a href="/dashboard">Back to Dashboard</a>
+        
+        <h2>Found {len(results)} matching posts</h2>
+        <table border="1">
+            <tr>
+                <th>Date</th>
+                <th>Subreddit</th>
+                <th>Title</th>
+                <th>Author</th>
+                <th>Score</th>
+                <th>Keywords</th>
+                <th>Link</th>
+            </tr>
+    '''
+    
+    for result in results:
+        html += f'''
+            <tr>
+                <td>{result.created_at.strftime('%Y-%m-%d %H:%M')}</td>
+                <td>r/{result.subreddit}</td>
+                <td>{result.title[:100]}</td>
+                <td>{result.author}</td>
+                <td>{result.score}</td>
+                <td>{result.keywords_found}</td>
+                <td><a href="{result.url}" target="_blank">View</a></td>
+            </tr>
+        '''
+    
+    html += '</table>'
+    return html
+
+@app.route('/run-scrape/<int:scrape_id>')
+@login_required
+def run_scrape_now(scrape_id):
+    scrape = Scrape.query.get_or_404(scrape_id)
+    
+    if scrape.user_id != session['user_id']:
+        flash('Access denied')
+        return redirect(url_for('dashboard'))
+    
+    run_scrape(scrape_id)
+    flash('Scrape completed! Check results.')
+    return redirect(url_for('dashboard'))
+
+@app.route('/toggle-scrape/<int:scrape_id>')
+@login_required
+def toggle_scrape(scrape_id):
+    scrape = Scrape.query.get_or_404(scrape_id)
+    
+    if scrape.user_id != session['user_id']:
+        flash('Access denied')
+        return redirect(url_for('dashboard'))
+    
+    scrape.is_active = not scrape.is_active
+    db.session.commit()
+    
+    status = "activated" if scrape.is_active else "paused"
+    flash(f'Scrape {status}')
+    return redirect(url_for('dashboard'))
+
+@app.route('/delete-scrape/<int:scrape_id>')
+@login_required
+def delete_scrape(scrape_id):
+    scrape = Scrape.query.get_or_404(scrape_id)
+    
+    if scrape.user_id != session['user_id']:
+        flash('Access denied')
+        return redirect(url_for('dashboard'))
+    
+    Result.query.filter_by(scrape_id=scrape_id).delete()
+    db.session.delete(scrape)
+    db.session.commit()
+    
+    flash('Scrape deleted')
+    return redirect(url_for('dashboard'))
+
+# Initialize scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=run_all_scrapes, trigger="interval", hours=1)
+scheduler.start()
 
 if __name__ == '__main__':
     with app.app_context():
