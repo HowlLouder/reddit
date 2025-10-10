@@ -1,14 +1,12 @@
+# app.py (full drop-in)
+
 from flask import Flask, request, redirect, url_for, session, flash, jsonify, abort
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
-import praw
-import json
+import praw, json, requests, os, logging
 from functools import wraps
-import requests
 from apscheduler.schedulers.background import BackgroundScheduler
-import os
-import logging
 from sqlalchemy import text
 
 # ------------ Flask & DB ------------
@@ -67,6 +65,24 @@ class Result(db.Model):
     # dedupe
     reddit_post_id = db.Column(db.String(50))
 
+# --- Ensure DB upgrade even under gunicorn (runs at import) ---
+def ensure_db_upgrade():
+    try:
+        with app.app_context():
+            db.create_all()  # base tables
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS ai_score SMALLINT;"))
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS ai_reasoning TEXT;"))
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS reddit_post_id TEXT;"))
+            db.session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uniq_result_scrape_post ON result (scrape_id, reddit_post_id);"))
+            db.session.commit()
+            print("✅ DB upgrade (ai_* columns) ensured at import.")
+    except Exception as e:
+        db.session.rollback()
+        print("⚠️ DB upgrade at import failed:", e)
+
+ensure_db_upgrade()
+# --- end upgrade block ---
+
 # ------------ Helpers ------------
 def get_reddit_instance():
     return praw.Reddit(
@@ -89,7 +105,7 @@ def send_to_ghl(result_data):
     try:
         headers = {'Authorization': f'Bearer {GHL_API_KEY}', 'Content-Type': 'application/json'}
         tags = result_data.get('keywords_found', [])
-        if isinstance(tags, str):
+        if isinstance(tags, string_types := str):
             tags = [t.strip() for t in tags.split(',') if t.strip()]
         contact_data = {
             'locationId': GHL_LOCATION_ID,
@@ -542,7 +558,7 @@ def delete_scrape(scrape_id):
     flash('Scrape deleted')
     return redirect(url_for('dashboard'))
 
-# Optional: cron-safe webhook
+# Optional: cron-safe webhook (Railway Cron can POST here)
 @app.route('/tasks/run-all', methods=['POST'])
 def tasks_run_all():
     if TASKS_TOKEN and request.headers.get('X-TASKS-TOKEN') != TASKS_TOKEN:
@@ -550,10 +566,10 @@ def tasks_run_all():
     run_all_scrapes()
     return jsonify({"ok": True})
 
-# Debug routes (helpful for confirming deploy & AI)
+# Debug routes
 @app.route('/debug/version')
 def debug_version():
-    return "ui-ai-v4"  # bump this string to verify new deploys
+    return "ui-ai-v5"
 
 @app.route('/debug/ai')
 def debug_ai():
@@ -569,8 +585,9 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(func=run_all_scrapes, trigger="interval", hours=1)
 scheduler.start()
 
-# ------------ Startup (DB upgrade) ------------
+# ------------ Dev server (local) ------------
 if __name__ == '__main__':
+    # also ensures admin for local runs
     with app.app_context():
         db.create_all()
         if not User.query.filter_by(username='admin').first():
@@ -582,19 +599,4 @@ if __name__ == '__main__':
             )
             db.session.add(admin)
             db.session.commit()
-            print("✅ Default admin user created.")
-
-        # Idempotent DB upgrade
-        try:
-            print("🔧 Running database upgrade for AI scoring columns...")
-            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS ai_score SMALLINT;"))
-            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS ai_reasoning TEXT;"))
-            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS reddit_post_id TEXT;"))
-            db.session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uniq_result_scrape_post ON result (scrape_id, reddit_post_id);"))
-            db.session.commit()
-            print("✅ Database upgrade complete!")
-        except Exception as e:
-            db.session.rollback()
-            print("⚠️ Database upgrade failed:", e)
-
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
