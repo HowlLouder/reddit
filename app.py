@@ -470,7 +470,10 @@ scheduler.start()
 
 if __name__ == '__main__':
     with app.app_context():
+        # Ensure all base tables exist
         db.create_all()
+
+        # Create default admin user if not present
         if not User.query.filter_by(username='admin').first():
             admin = User(
                 username='admin',
@@ -480,5 +483,23 @@ if __name__ == '__main__':
             )
             db.session.add(admin)
             db.session.commit()
-    
+            print("✅ Default admin user created.")
+
+        # --- Database upgrade for AI columns ---
+        from sqlalchemy import text
+        print("🔧 Running database upgrade for AI scoring columns...")
+        try:
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS ai_score SMALLINT;"))
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS ai_reasoning TEXT;"))
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS reddit_post_id TEXT;"))
+            db.session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uniq_result_scrape_post ON result (scrape_id, reddit_post_id);"))
+            db.session.commit()
+            print("✅ Database upgrade complete!")
+        except Exception as e:
+            db.session.rollback()
+            print("⚠️ Database upgrade failed:", e)
+        # --- End upgrade ---
+
+    # Start the web app
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
