@@ -452,11 +452,13 @@ def dashboard():
     kpis = kpis_for_user(user_id, days=7)
     labels, totals, quals = daily_counts(user_id, days=7)
 
+    # Recent results (hidden excluded)
     recent = db.session.query(Result, Scrape).join(Scrape, Result.scrape_id == Scrape.id)\
         .filter(Scrape.user_id == user_id)\
         .filter((Result.is_hidden == False) | (Result.is_hidden == None))\
         .order_by(Result.created_at.desc()).limit(10).all()
 
+    # KPI cards
     cards = f"""
     <div class="row g-3">
       <div class="col-6 col-md-3">
@@ -490,6 +492,7 @@ def dashboard():
     </div>
     """
 
+    # Chart
     chart = f"""
     <div class="card mt-4 p-3">
       <div class="d-flex justify-content-between align-items-center">
@@ -521,7 +524,8 @@ def dashboard():
     </script>
     """
 
-    rows = ""
+    # Recent results table
+    recent_rows = ""
     for r, s in recent:
         badge = score_badge(r.ai_score)
         actions = [f'<a class="btn btn-sm btn-outline-primary" target="_blank" href="{r.url}">Open</a>']
@@ -531,7 +535,7 @@ def dashboard():
             actions.append(f'<a class="btn btn-sm btn-outline-secondary" href="/result/{r.id}/unhide">Unhide</a>')
         else:
             actions.append(f'<a class="btn btn-sm btn-outline-danger" href="/result/{r.id}/hide">Hide</a>')
-        rows += f"""
+        recent_rows += f"""
         <tr>
           <td>{r.created_at.strftime('%Y-%m-%d %H:%M')}</td>
           <td><span class="muted">r/</span>{r.subreddit}</td>
@@ -541,7 +545,7 @@ def dashboard():
         </tr>
         """
 
-    table = f"""
+    recent_table = f"""
     <div class="card mt-4 p-3">
       <div class="d-flex justify-content-between align-items-center">
         <h5 class="mb-0">Recent results</h5>
@@ -552,13 +556,60 @@ def dashboard():
           <thead>
             <tr><th>Date</th><th>Subreddit</th><th>Title</th><th>AI</th><th>Actions</th></tr>
           </thead>
-          <tbody>{rows or '<tr><td colspan="5" class="text-center py-4">No recent results.</td></tr>'}</tbody>
+          <tbody>{recent_rows or '<tr><td colspan="5" class="text-center py-4">No recent results.</td></tr>'}</tbody>
         </table>
       </div>
     </div>
     """
 
-    return page_wrap(cards + chart + table, "Dashboard")
+    # >>> NEW: Scrapes table with "View Results" <<<
+    scrapes = Scrape.query.filter_by(user_id=user_id).order_by(Scrape.created_at.desc()).all()
+    scrape_rows = ""
+    for s in scrapes:
+        last_run = s.last_run.strftime('%Y-%m-%d %H:%M') if s.last_run else 'Never'
+        status_html = badge_for_status(s.is_active)
+        result_count = db.session.query(func.count(Result.id))\
+            .filter(Result.scrape_id == s.id)\
+            .filter((Result.is_hidden == False) | (Result.is_hidden == None))\
+            .scalar() or 0
+        scrape_rows += f"""
+        <tr>
+          <td>{s.name}</td>
+          <td><code>{s.subreddits}</code></td>
+          <td><code>{s.keywords}</code></td>
+          <td>{status_html}</td>
+          <td>{last_run}</td>
+          <td><a href="/results/{s.id}">{result_count} results</a></td>
+          <td class="text-nowrap">
+            <a class="btn btn-sm btn-outline-primary" href="/results/{s.id}">View Results</a>
+            <a class="btn btn-sm btn-outline-info" href="/edit-scrape/{s.id}">Edit</a>
+            <a class="btn btn-sm btn-outline-secondary" href="/run-scrape/{s.id}">Run</a>
+            <a class="btn btn-sm btn-outline-warning" href="/toggle-scrape/{s.id}">Toggle</a>
+            <a class="btn btn-sm btn-outline-danger" href="/delete-scrape/{s.id}" onclick="return confirm('Delete this scrape?')">Delete</a>
+          </td>
+        </tr>
+        """
+
+    scrapes_table = f"""
+    <div class="card mt-4 p-3">
+      <div class="d-flex justify-content-between align-items-center">
+        <h5 class="mb-0">Your scrapes</h5>
+        <a class="btn btn-sm btn-outline-light" href="/create-scrape"><i class="bi bi-plus"></i> New Scrape</a>
+      </div>
+      <div class="table-responsive mt-2">
+        <table class="table table-sm align-middle">
+          <thead>
+            <tr>
+              <th>Name</th><th>Subreddits</th><th>Keywords</th><th>Status</th><th>Last Run</th><th>Results</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>{scrape_rows or '<tr><td colspan="7" class="text-center py-4">No scrapes yet.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+    """
+
+    return page_wrap(cards + chart + recent_table + scrapes_table, "Dashboard")
 
 @app.route('/create-scrape', methods=['GET', 'POST'])
 @login_required
