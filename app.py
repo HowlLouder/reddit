@@ -3,11 +3,11 @@
 from flask import Flask, request, redirect, url_for, session, flash, jsonify, abort
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
+from datetime import datetime, timedelta
 import praw, json, requests, os, logging
 from functools import wraps
 from apscheduler.schedulers.background import BackgroundScheduler
-from sqlalchemy import text
+from sqlalchemy import text, func, case
 
 # ------------ Flask & DB ------------
 app = Flask(__name__)
@@ -64,6 +64,8 @@ class Result(db.Model):
     ai_reasoning = db.Column(db.Text)
     # dedupe
     reddit_post_id = db.Column(db.String(50))
+    # archive/hide
+    is_hidden = db.Column(db.Boolean, default=False)
 
 # --- Ensure DB upgrade even under gunicorn (runs at import) ---
 def ensure_db_upgrade():
@@ -73,9 +75,12 @@ def ensure_db_upgrade():
             db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS ai_score SMALLINT;"))
             db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS ai_reasoning TEXT;"))
             db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS reddit_post_id TEXT;"))
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN;"))
+            db.session.execute(text("UPDATE result SET is_hidden = FALSE WHERE is_hidden IS NULL;"))
             db.session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uniq_result_scrape_post ON result (scrape_id, reddit_post_id);"))
+            db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_result_scrape_hidden_created ON result (scrape_id, is_hidden, created_at DESC);"))
             db.session.commit()
-            print("✅ DB upgrade (ai_* columns) ensured at import.")
+            print("✅ DB upgrade ensured (ai_* + is_hidden).")
     except Exception as e:
         db.session.rollback()
         print("⚠️ DB upgrade at import failed:", e)
@@ -105,7 +110,7 @@ def send_to_ghl(result_data):
     try:
         headers = {'Authorization': f'Bearer {GHL_API_KEY}', 'Content-Type': 'application/json'}
         tags = result_data.get('keywords_found', [])
-        if isinstance(tags, string_types := str):
+        if isinstance(tags, str):
             tags = [t.strip() for t in tags.split(',') if t.strip()]
         contact_data = {
             'locationId': GHL_LOCATION_ID,
@@ -213,7 +218,8 @@ def run_scrape(scrape_id):
                             keywords_found=','.join(found_keywords),
                             ai_score=ai_score_val,
                             ai_reasoning=ai_reason,
-                            reddit_post_id=post_id
+                            reddit_post_id=post_id,
+                            is_hidden=False
                         )
                         db.session.add(result)
                         results_count += 1
@@ -244,14 +250,51 @@ def run_all_scrapes():
         for scrape in scrapes:
             run_scrape(scrape.id)
 
-# ------------ UI helpers (Bootstrap) ------------
-BOOTSTRAP_CDN = '<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">'
+# ---------- Dashboard shell (Bootstrap + Icons + Chart.js) ----------
+BOOTSTRAP_SHELL = """
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body{background:#0b0f14;color:#e5eef7}
+  .navbar{background:#0e141b;border-bottom:1px solid #1c2733}
+  .card{background:#0e141b;border:1px solid #1c2733}
+  .table{--bs-table-color:#e5eef7;--bs-table-bg:transparent;--bs-table-border-color:#1c2733}
+  .table thead{background:#121a23}
+  .badge.text-bg-success{background:#16a34a!important}
+  .badge.text-bg-warning{background:#f59e0b!important;color:#0b0f14}
+  .badge.text-bg-danger{background:#ef4444!important}
+  a{color:#8ab4ff}
+  .muted{color:#97a6b8}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+"""
+
 def page_wrap(inner_html: str, page_title: str = "") -> str:
     title = f"{page_title} – Reddit Scraper" if page_title else "Reddit Scraper"
-    return f"""{BOOTSTRAP_CDN}
-<meta name="viewport" content="width=device-width, initial-scale=1">
+    return f"""{BOOTSTRAP_SHELL}
 <title>{title}</title>
-<div class="container py-4">{inner_html}</div>"""
+
+<nav class="navbar navbar-expand-lg">
+  <div class="container-fluid">
+    <a class="navbar-brand text-light fw-semibold" href="/dashboard"><i class="bi bi-rocket-takeoff"></i> Reddit Leads</a>
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#nav" aria-controls="nav" aria-expanded="false">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+    <div id="nav" class="collapse navbar-collapse">
+      <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+        <li class="nav-item"><a class="nav-link text-light" href="/dashboard">Dashboard</a></li>
+        <li class="nav-item"><a class="nav-link text-light" href="/create-scrape">New Scrape</a></li>
+      </ul>
+      <span class="muted me-3">Hi, {session.get("username","guest")}</span>
+      {'<a class="btn btn-outline-light btn-sm" href="/logout">Logout</a>' if session.get('user_id') else '<a class="btn btn-outline-light btn-sm" href="/login">Login</a>'}
+    </div>
+  </div>
+</nav>
+
+<div class="container py-4">{inner_html}</div>
+"""
 
 def badge_for_status(is_active: bool) -> str:
     return '<span class="badge text-bg-success">Active</span>' if is_active else '<span class="badge text-bg-secondary">Paused</span>'
@@ -266,6 +309,46 @@ def score_badge(score) -> str:
     if s >= 9:  return f'<span class="badge text-bg-success">{s}</span>'
     if s >= 7:  return f'<span class="badge text-bg-warning">{s}</span>'
     return f'<span class="badge text-bg-danger">{s}</span>'
+
+# ---------- Metrics helpers ----------
+def kpis_for_user(user_id: int, days: int = 7, min_score: int = None):
+    min_score = AI_MIN_SCORE if min_score is None else min_score
+    since = datetime.utcnow() - timedelta(days=days)
+
+    total_scrapes = db.session.query(func.count(Scrape.id)).filter_by(user_id=user_id).scalar() or 0
+    active_scrapes = db.session.query(func.count(Scrape.id)).filter_by(user_id=user_id, is_active=True).scalar() or 0
+
+    res_base = db.session.query(Result.id).join(Scrape, Result.scrape_id == Scrape.id)\
+        .filter(Scrape.user_id == user_id, Result.created_at >= since)\
+        .filter((Result.is_hidden == False) | (Result.is_hidden == None))
+    total_results = res_base.count()
+
+    qualified = db.session.query(Result.id).join(Scrape, Result.scrape_id == Scrape.id)\
+        .filter(Scrape.user_id == user_id, Result.created_at >= since)\
+        .filter((Result.is_hidden == False) | (Result.is_hidden == None))\
+        .filter(Result.ai_score >= min_score).count()
+
+    return {"total_scrapes": total_scrapes, "active_scrapes": active_scrapes,
+            "total_results": total_results, "qualified": qualified, "since": since}
+
+def daily_counts(user_id: int, days: int = 7):
+    since = datetime.utcnow() - timedelta(days=days-1)
+    rows = db.session.query(
+        func.date_trunc('day', Result.created_at).label('d'),
+        func.count(Result.id),
+        func.sum(case((Result.ai_score >= AI_MIN_SCORE, 1), else_=0))
+    ).join(Scrape, Result.scrape_id == Scrape.id)\
+     .filter(Scrape.user_id == user_id, Result.created_at >= since)\
+     .filter((Result.is_hidden == False) | (Result.is_hidden == None))\
+     .group_by('d').order_by('d').all()
+
+    by_day = {r[0].date(): (int(r[1]), int(r[2] or 0)) for r in rows}
+    labels, totals, quals = [], [], []
+    for i in range(days):
+        day = (since.date() + timedelta(days=i))
+        t, q = by_day.get(day, (0, 0))
+        labels.append(day.strftime('%b %d')); totals.append(t); quals.append(q)
+    return labels, totals, quals
 
 # ------------ Routes ------------
 @app.route('/init-db')
@@ -303,9 +386,9 @@ def index():
         return redirect(url_for('dashboard'))
     html = '''
         <h1 class="mb-2">Reddit Scraper Platform</h1>
-        <p class="text-muted">Monitor Reddit for keywords and push qualified leads to GoHighLevel.</p>
+        <p class="muted">Monitor Reddit for keywords and push qualified leads to GoHighLevel.</p>
         <a class="btn btn-primary me-2" href="/login">Login</a>
-        <a class="btn btn-outline-secondary" href="/register">Register</a>
+        <a class="btn btn-outline-light" href="/register">Register</a>
     '''
     return page_wrap(html, "Home")
 
@@ -365,46 +448,117 @@ def logout():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    scrapes = Scrape.query.filter_by(user_id=session['user_id']).all()
-    rows = ""
-    for scrape in scrapes:
-        result_count = Result.query.filter_by(scrape_id=scrape.id).count()
-        status_html = badge_for_status(scrape.is_active)
-        last_run = scrape.last_run.strftime('%Y-%m-%d %H:%M') if scrape.last_run else 'Never'
-        rows += f'''
-            <tr>
-                <td>{scrape.name}</td>
-                <td><code>{scrape.subreddits}</code></td>
-                <td><code>{scrape.keywords}</code></td>
-                <td>{status_html}</td>
-                <td>{last_run}</td>
-                <td><a href="/results/{scrape.id}">{result_count} results</a></td>
-                <td class="text-nowrap">
-                    <a class="btn btn-sm btn-outline-primary" href="/run-scrape/{scrape.id}">Run Now</a>
-                    <a class="btn btn-sm btn-outline-secondary" href="/toggle-scrape/{scrape.id}">Toggle</a>
-                    <a class="btn btn-sm btn-outline-danger" href="/delete-scrape/{scrape.id}" onclick="return confirm('Delete this scrape?')">Delete</a>
-                </td>
-            </tr>
-        '''
-    if not scrapes:
-        rows = '<tr><td colspan="7" class="text-center py-4">No scrapes yet. Create your first one!</td></tr>'
-    html = f'''
-        <div class="d-flex justify-content-between align-items-center">
-          <h1 class="mb-3">Welcome {session["username"]}!</h1>
-          <div>
-            <a class="btn btn-outline-secondary btn-sm" href="/logout">Logout</a>
-            <a class="btn btn-primary btn-sm ms-2" href="/create-scrape">Create New Scrape</a>
-          </div>
+    user_id = session['user_id']
+    kpis = kpis_for_user(user_id, days=7)
+    labels, totals, quals = daily_counts(user_id, days=7)
+
+    recent = db.session.query(Result, Scrape).join(Scrape, Result.scrape_id == Scrape.id)\
+        .filter(Scrape.user_id == user_id)\
+        .filter((Result.is_hidden == False) | (Result.is_hidden == None))\
+        .order_by(Result.created_at.desc()).limit(10).all()
+
+    cards = f"""
+    <div class="row g-3">
+      <div class="col-6 col-md-3">
+        <div class="card p-3">
+          <div class="muted">Scrapes</div>
+          <div class="fs-3 fw-bold">{kpis['total_scrapes']}</div>
+          <div class="muted"><i class="bi bi-circle-fill text-success me-1"></i>{kpis['active_scrapes']} active</div>
         </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card p-3">
+          <div class="muted">Results (7d)</div>
+          <div class="fs-3 fw-bold">{kpis['total_results']}</div>
+          <div class="muted">since {kpis['since'].strftime('%b %d')}</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card p-3">
+          <div class="muted">Qualified ≥ {AI_MIN_SCORE} (7d)</div>
+          <div class="fs-3 fw-bold">{kpis['qualified']}</div>
+          <div class="muted">auto-sent to GHL</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card p-3">
+          <div class="muted">AI Threshold</div>
+          <div class="fs-3 fw-bold">{AI_MIN_SCORE}</div>
+          <div class="muted">set via AI_MIN_SCORE</div>
+        </div>
+      </div>
+    </div>
+    """
+
+    chart = f"""
+    <div class="card mt-4 p-3">
+      <div class="d-flex justify-content-between align-items-center">
+        <h5 class="mb-0">Leads over last 7 days</h5>
+      </div>
+      <canvas id="leadsChart" height="120" class="mt-3"></canvas>
+    </div>
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {{
+      const ctx = document.getElementById('leadsChart');
+      new Chart(ctx, {{
+        type: 'line',
+        data: {{
+          labels: {json.dumps(labels)},
+          datasets: [
+            {{ label: 'Total matches', data: {json.dumps(totals)}, borderWidth: 2, tension: .25 }},
+            {{ label: 'Qualified (AI)', data: {json.dumps(quals)}, borderWidth: 2, borderDash: [5,5], tension: .25 }}
+          ]
+        }},
+        options: {{
+          plugins: {{ legend: {{ labels: {{ color: '#e5eef7' }} }} }},
+          scales: {{
+            x: {{ ticks: {{ color: '#97a6b8' }}, grid: {{ color: '#1c2733' }} }},
+            y: {{ ticks: {{ color: '#97a6b8' }}, grid: {{ color: '#1c2733' }}, beginAtZero: true }}
+          }}
+        }}
+      }});
+    }});
+    </script>
+    """
+
+    rows = ""
+    for r, s in recent:
+        badge = score_badge(r.ai_score)
+        actions = [f'<a class="btn btn-sm btn-outline-primary" target="_blank" href="{r.url}">Open</a>']
+        if (r.ai_score or 0) < AI_MIN_SCORE:
+            actions.append(f'<a class="btn btn-sm btn-outline-success" href="/send-to-ghl/{r.id}">Send</a>')
+        if r.is_hidden:
+            actions.append(f'<a class="btn btn-sm btn-outline-secondary" href="/result/{r.id}/unhide">Unhide</a>')
+        else:
+            actions.append(f'<a class="btn btn-sm btn-outline-danger" href="/result/{r.id}/hide">Hide</a>')
+        rows += f"""
+        <tr>
+          <td>{r.created_at.strftime('%Y-%m-%d %H:%M')}</td>
+          <td><span class="muted">r/</span>{r.subreddit}</td>
+          <td>{(r.title or '')[:80]}{'...' if (r.title and len(r.title)>80) else ''}</td>
+          <td>{badge}</td>
+          <td class="text-nowrap">{' '.join(actions)}</td>
+        </tr>
+        """
+
+    table = f"""
+    <div class="card mt-4 p-3">
+      <div class="d-flex justify-content-between align-items-center">
+        <h5 class="mb-0">Recent results</h5>
+        <a class="btn btn-sm btn-outline-light" href="/create-scrape"><i class="bi bi-plus"></i> New Scrape</a>
+      </div>
+      <div class="table-responsive mt-2">
         <table class="table table-sm align-middle">
-            <thead class="table-light">
-                <tr><th>Name</th><th>Subreddits</th><th>Keywords</th><th>Status</th><th>Last Run</th><th>Results</th><th></th></tr>
-            </thead>
-            <tbody>{rows}</tbody>
+          <thead>
+            <tr><th>Date</th><th>Subreddit</th><th>Title</th><th>AI</th><th>Actions</th></tr>
+          </thead>
+          <tbody>{rows or '<tr><td colspan="5" class="text-center py-4">No recent results.</td></tr>'}</tbody>
         </table>
-        <p class="text-muted"><small>ℹ️ AI auto-sends when score ≥ {AI_MIN_SCORE}. Adjust via env var.</small></p>
-    '''
-    return page_wrap(html, "Dashboard")
+      </div>
+    </div>
+    """
+
+    return page_wrap(cards + chart + table, "Dashboard")
 
 @app.route('/create-scrape', methods=['GET', 'POST'])
 @login_required
@@ -438,64 +592,138 @@ def create_scrape():
     '''
     return page_wrap(html, "Create Scrape")
 
+# ---------- Hide / Unhide / Bulk hide ----------
+@app.route('/result/<int:result_id>/hide', methods=['POST', 'GET'])
+@login_required
+def hide_result(result_id):
+    r = Result.query.get_or_404(result_id)
+    s = Scrape.query.get(r.scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+    r.is_hidden = True
+    db.session.commit()
+    flash('Post hidden')
+    return redirect(url_for('view_results', scrape_id=r.scrape_id, **{k: v for k, v in request.args.items()}))
+
+@app.route('/result/<int:result_id>/unhide', methods=['POST', 'GET'])
+@login_required
+def unhide_result(result_id):
+    r = Result.query.get_or_404(result_id)
+    s = Scrape.query.get(r.scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+    r.is_hidden = False
+    db.session.commit()
+    flash('Post unhidden')
+    return redirect(url_for('view_results', scrape_id=r.scrape_id, show_hidden=1))
+
+@app.route('/results/<int:scrape_id>/hide-below', methods=['POST'])
+@login_required
+def hide_below(scrape_id):
+    s = Scrape.query.get_or_404(scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+    try:
+        threshold = int(request.form.get('threshold', AI_MIN_SCORE))
+    except:
+        threshold = AI_MIN_SCORE
+    q = Result.query.filter_by(scrape_id=scrape_id).filter((Result.ai_score < threshold) | (Result.ai_score == None))
+    updated = q.update({Result.is_hidden: True}, synchronize_session=False)
+    db.session.commit()
+    flash(f'Hidden {updated} posts below score {threshold}')
+    return redirect(url_for('view_results', scrape_id=scrape_id, show_hidden=0))
+
 @app.route('/results/<int:scrape_id>')
 @login_required
 def view_results(scrape_id):
     scrape = Scrape.query.get_or_404(scrape_id)
     if scrape.user_id != session['user_id']:
-        flash('Access denied')
-        return redirect(url_for('dashboard'))
+        flash('Access denied'); return redirect(url_for('dashboard'))
 
     try:
         min_score = int(request.args.get('min_score', '0'))
     except:
         min_score = 0
+    show_hidden = request.args.get('show_hidden', '0') == '1'
 
     q = Result.query.filter_by(scrape_id=scrape_id)
+    if not show_hidden:
+        q = q.filter((Result.is_hidden == False) | (Result.is_hidden == None))
     if min_score:
         q = q.filter(Result.ai_score >= min_score)
+
     results = q.order_by(Result.created_at.desc()).all()
+
+    toolbar = f'''
+    <div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
+      <form class="row row-cols-lg-auto g-2 align-items-center" method="GET">
+        <input type="hidden" name="show_hidden" value="{1 if show_hidden else 0}">
+        <div class="col-12">
+          <label class="form-label me-2">Min Score</label>
+          <input class="form-control form-control-sm" type="number" min="0" max="10" name="min_score" value="{min_score}">
+        </div>
+        <div class="col-12">
+          <button class="btn btn-sm btn-outline-primary" type="submit">Apply</button>
+        </div>
+      </form>
+      <div class="d-flex align-items-center gap-2">
+        <form method="GET">
+          <input type="hidden" name="min_score" value="{min_score}">
+          <input type="hidden" name="show_hidden" value="{0 if show_hidden else 1}">
+          <button class="btn btn-sm btn-outline-light" type="submit">
+            {'Hide Hidden' if show_hidden else 'Show Hidden'}
+          </button>
+        </form>
+        <form method="POST" action="/results/{scrape_id}/hide-below">
+          <input type="hidden" name="threshold" value="{max(min_score, AI_MIN_SCORE)}">
+          <button class="btn btn-sm btn-outline-warning" onclick="return confirm('Hide all posts below threshold?')">
+            Hide all &lt; {max(min_score, AI_MIN_SCORE)}
+          </button>
+        </form>
+        <a class="btn btn-sm btn-outline-light" href="/run-scrape/{scrape.id}"><i class="bi bi-arrow-repeat"></i> Run Now</a>
+        <a class="btn btn-sm btn-outline-light" href="/dashboard">Back</a>
+      </div>
+    </div>
+    '''
 
     rows = ""
     for r in results:
         ai_html = f"""{score_badge(r.ai_score)}
             {f'<div class="text-muted small">{r.ai_reasoning}</div>' if r.ai_reasoning else ''}"""
-        actions = ""
+        actions = []
+        actions.append(f'<a class="btn btn-sm btn-outline-primary" target="_blank" href="{r.url}">Open</a>')
         if (r.ai_score or 0) < AI_MIN_SCORE:
-            actions = f'<a class="btn btn-sm btn-outline-success" href="/send-to-ghl/{r.id}">Send to GHL</a>'
+            actions.append(f'<a class="btn btn-sm btn-outline-success" href="/send-to-ghl/{r.id}?min_score={min_score}&show_hidden={1 if show_hidden else 0}">Send</a>')
+        if r.is_hidden:
+            actions.append(f'<a class="btn btn-sm btn-outline-secondary" href="/result/{r.id}/unhide">Unhide</a>')
+        else:
+            actions.append(f'<a class="btn btn-sm btn-outline-danger" href="/result/{r.id}/hide?min_score={min_score}&show_hidden={1 if show_hidden else 0}">Hide</a>')
+
+        hidden_tag = '<span class="badge text-bg-secondary ms-2">Hidden</span>' if r.is_hidden else ''
         rows += f'''
-            <tr>
+            <tr class="{'opacity-50' if r.is_hidden else ''}">
                 <td>{r.created_at.strftime('%Y-%m-%d %H:%M')}</td>
                 <td>r/{r.subreddit}</td>
-                <td>{(r.title or "")[:100]}{"..." if len(r.title or "")>100 else ""}</td>
+                <td>{(r.title or "")[:100]}{"..." if len(r.title or "")>100 else ""} {hidden_tag}</td>
                 <td>u/{r.author}</td>
                 <td>{r.score}</td>
                 <td><code>{r.keywords_found or ""}</code></td>
                 <td>{ai_html}</td>
-                <td><a class="btn btn-sm btn-outline-primary" target="_blank" href="{r.url}">Open</a> {actions}</td>
+                <td class="text-nowrap">{' '.join(actions)}</td>
             </tr>
         '''
+
     if not results:
-        rows = '<tr><td colspan="8" class="text-center py-4">No results yet. Run the scrape to find matching posts!</td></tr>'
+        rows = '<tr><td colspan="8" class="text-center py-4">No results for current filters.</td></tr>'
 
     html = f'''
         <h1 class="mb-2">Results for: {scrape.name}</h1>
-        <a class="d-inline-block mb-3" href="/dashboard">← Back to Dashboard</a>
-
-        <form class="row row-cols-lg-auto g-2 align-items-center mb-3" method="GET">
-          <div class="col-12">
-            <label class="form-label me-2">Min Score</label>
-            <input class="form-control form-control-sm" type="number" min="0" max="10" name="min_score" value="{min_score}">
-          </div>
-          <div class="col-12"><button class="btn btn-sm btn-outline-primary" type="submit">Apply</button></div>
-          <div class="col-12"><span class="ms-3 small text-muted">Auto-send to GHL when score ≥ {AI_MIN_SCORE}</span></div>
-        </form>
-
+        {toolbar}
         <table class="table table-sm align-middle">
             <thead class="table-light">
                 <tr>
                     <th>Date</th><th>Subreddit</th><th>Title</th><th>Author</th>
-                    <th>Upvotes</th><th>Keywords</th><th>AI</th><th>Link</th>
+                    <th>Upvotes</th><th>Keywords</th><th>AI</th><th>Actions</th>
                 </tr>
             </thead>
             <tbody>{rows}</tbody>
@@ -569,7 +797,7 @@ def tasks_run_all():
 # Debug routes
 @app.route('/debug/version')
 def debug_version():
-    return "ui-ai-v5"
+    return "ui-ai-v6"
 
 @app.route('/debug/ai')
 def debug_ai():
@@ -587,7 +815,6 @@ scheduler.start()
 
 # ------------ Dev server (local) ------------
 if __name__ == '__main__':
-    # also ensures admin for local runs
     with app.app_context():
         db.create_all()
         if not User.query.filter_by(username='admin').first():
