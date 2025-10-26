@@ -1,54 +1,40 @@
 import os
-import logging
 from datetime import datetime, timezone
-from typing import Optional, Tuple
 
-import requests
 from flask import Flask, jsonify, request, abort
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import inspect, text, event
-from sqlalchemy.engine import Engine
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 # --------------------------------------------------------------------------------------
-# Config & DB
+# Config
 # --------------------------------------------------------------------------------------
 
 db = SQLAlchemy()
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-log = logging.getLogger("reddit-scraper-api")
 
-DEFAULT_DB = "sqlite:///app.db"
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB)
+def normalize_db_url(url: str) -> str:
+    # Heroku-style URLs still show up sometimes
+    if url and url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
+    return url
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    app.config["SQLALCHEMY_DATABASE_URI"] = normalize_db_url(DATABASE_URL)
+
+    database_url = normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///app.db"))
+    app.config["SQLALCHEMY_DATABASE_URI"] = database_url
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
     db.init_app(app)
 
-    with app.app_context():
-        ensure_db_upgrade()
+    # Defer touching the DB until the server actually receives traffic.
+    # This avoids boot-time connect() and any on_connect weirdness.
+    @app.before_first_request
+    def _create_tables_once():
+        db.create_all()
 
     register_routes(app)
     return app
-
-def normalize_db_url(url: str) -> str:
-    # Support deprecated postgres:// scheme
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    return url
-
-# Enable foreign keys on SQLite
-@event.listens_for(Engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    try:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON;")
-        cursor.close()
-    except Exception:
-        pass
 
 # --------------------------------------------------------------------------------------
 # Models
@@ -58,19 +44,28 @@ class Post(db.Model):
     __tablename__ = "posts"
 
     id = db.Column(db.Integer, primary_key=True)
-    reddit_id = db.Column(db.String(24), unique=True, index=True, nullable=False)  # thing id
+    reddit_id = db.Column(db.String(24), unique=True, index=True, nullable=False)
     title = db.Column(db.Text, nullable=False)
-    author = db.Column(db.String(255), nullable=True)
-    url = db.Column(db.Text, nullable=True)
-    permalink = db.Column(db.Text, nullable=True)
-    created_utc = db.Column(db.DateTime(timezone=True), nullable=True)
-    score = db.Column(db.Integer, nullable=True)
-    num_comments = db.Column(db.Integer, nullable=True)
+    author = db.Column(db.String(255))
+    url = db.Column(db.Text)
+    permalink = db.Column(db.Text)
+    created_utc = db.Column(db.DateTime(timezone=True))
+    score = db.Column(db.Integer)
+    num_comments = db.Column(db.Integer)
 
-    hidden = db.Column(db.Boolean, nullable=False, default=False, server_default=text("FALSE"))
+    hidden = db.Column(db.Boolean, nullable=False, default=False, server_default="0")
 
-    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
-    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
 
     def to_dict(self):
         return {
@@ -89,113 +84,6 @@ class Post(db.Model):
         }
 
 # --------------------------------------------------------------------------------------
-# DB bootstrap / light migration
-# --------------------------------------------------------------------------------------
-
-def ensure_db_upgrade():
-    """
-    Safe, idempotent bootstrap:
-    - create tables if missing
-    - ensure 'hidden' column exists
-    No autocommit hacks; uses proper transaction context.
-    """
-    engine = db.engine
-    inspector = inspect(engine)
-
-    # 1) Create tables
-    with engine.begin() as conn:
-        db.metadata.create_all(bind=conn)
-
-    # 2) Ensure 'hidden' column exists on posts
-    columns = {c["name"] for c in inspector.get_columns("posts")}
-    if "hidden" not in columns:
-        engine_name = engine.url.get_backend_name()
-        log.info("Adding missing 'hidden' column to posts...")
-        with engine.begin() as conn:
-            if engine_name == "postgresql":
-                conn.execute(text('ALTER TABLE posts ADD COLUMN "hidden" BOOLEAN NOT NULL DEFAULT FALSE;'))
-            else:
-                # SQLite supports ADD COLUMN with default; existing rows get default.
-                conn.execute(text('ALTER TABLE posts ADD COLUMN hidden BOOLEAN NOT NULL DEFAULT 0;'))
-
-# --------------------------------------------------------------------------------------
-# Scraper (public JSON; no PRAW dependency)
-# --------------------------------------------------------------------------------------
-
-REDDIT_UA = os.getenv("REDDIT_USER_AGENT", "SignalBot/1.0 (+https://example.com)")
-
-def fetch_subreddit_new(subreddit: str, limit: int = 25, after: Optional[str] = None) -> Tuple[list, Optional[str]]:
-    params = {"limit": max(1, min(limit, 100))}
-    if after:
-        params["after"] = after
-
-    resp = requests.get(
-        f"https://www.reddit.com/r/{subreddit}/new.json",
-        headers={"User-Agent": REDDIT_UA},
-        params=params,
-        timeout=20,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Reddit returned {resp.status_code}: {resp.text[:400]}")
-
-    data = resp.json().get("data", {})
-    children = data.get("children", [])
-    after_token = data.get("after")
-
-    posts = []
-    for ch in children:
-        d = ch.get("data", {})
-        posts.append({
-            "reddit_id": d.get("id"),
-            "title": d.get("title") or "(untitled)",
-            "author": d.get("author"),
-            "url": d.get("url_overridden_by_dest") or d.get("url"),
-            "permalink": f"https://reddit.com{d.get('permalink')}" if d.get("permalink") else None,
-            "created_utc": datetime.fromtimestamp(d.get("created_utc", 0), tz=timezone.utc) if d.get("created_utc") else None,
-            "score": d.get("score"),
-            "num_comments": d.get("num_comments"),
-        })
-    return posts, after_token
-
-def upsert_posts(posts: list) -> int:
-    """
-    Insert posts by reddit_id; ignore duplicates gracefully.
-    Returns number of newly inserted rows.
-    """
-    inserted = 0
-    for p in posts:
-        if not p.get("reddit_id"):
-            continue
-        exists = Post.query.filter_by(reddit_id=p["reddit_id"]).first()
-        if exists:
-            # Optional: update mutable fields (score/comments/title)
-            exists.title = p.get("title") or exists.title
-            exists.author = p.get("author") or exists.author
-            exists.url = p.get("url") or exists.url
-            exists.permalink = p.get("permalink") or exists.permalink
-            exists.score = p.get("score") if p.get("score") is not None else exists.score
-            exists.num_comments = p.get("num_comments") if p.get("num_comments") is not None else exists.num_comments
-            # keep created_utc if present, but don't overwrite if missing
-        else:
-            post = Post(
-                reddit_id=p["reddit_id"],
-                title=p.get("title") or "(untitled)",
-                author=p.get("author"),
-                url=p.get("url"),
-                permalink=p.get("permalink"),
-                created_utc=p.get("created_utc"),
-                score=p.get("score"),
-                num_comments=p.get("num_comments"),
-            )
-            db.session.add(post)
-            inserted += 1
-    try:
-        db.session.commit()
-    except IntegrityError:
-        db.session.rollback()
-    return inserted
-
-# --------------------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------------------
 
@@ -203,12 +91,11 @@ def register_routes(app: Flask):
 
     @app.get("/healthz")
     def healthz():
-        # Quick connectivity probe
         try:
+            # Lightweight check that also initializes a connection only when called
             db.session.execute(text("SELECT 1"))
             return jsonify({"status": "ok"}), 200
         except Exception as e:
-            log.exception("Health check failed")
             return jsonify({"status": "error", "detail": str(e)}), 500
 
     @app.get("/")
@@ -221,14 +108,12 @@ def register_routes(app: Flask):
                 "PATCH /posts/<id>/hide": "Hide a post",
                 "PATCH /posts/<id>/unhide": "Unhide a post",
                 "POST /posts": "Create a post (JSON body)",
-                "POST /scrape": "Scrape subreddit (JSON body: subreddit, limit, pages)",
             }
         })
 
-    # -------- Posts --------
-
     @app.get("/posts")
     def list_posts():
+        # pagination + filter
         try:
             page = max(1, int(request.args.get("page", 1)))
             per_page = max(1, min(100, int(request.args.get("per_page", 20))))
@@ -254,10 +139,9 @@ def register_routes(app: Flask):
     @app.post("/posts")
     def create_post():
         data = request.get_json(silent=True) or {}
-        require_fields = ["reddit_id", "title"]
-        for f in require_fields:
-            if not data.get(f):
-                abort(400, description=f"Missing required field: {f}")
+        for field in ("reddit_id", "title"):
+            if not data.get(field):
+                abort(400, description=f"Missing required field: {field}")
 
         p = Post(
             reddit_id=data["reddit_id"],
@@ -293,39 +177,7 @@ def register_routes(app: Flask):
         db.session.commit()
         return jsonify(p.to_dict())
 
-    # -------- Scrape --------
-
-    @app.post("/scrape")
-    def scrape():
-        """
-        Body:
-        {
-          "subreddit": "all",
-          "limit": 25,     # per page (1..100), default 25
-          "pages": 1       # pagination pages to follow, default 1
-        }
-        """
-        body = request.get_json(silent=True) or {}
-        subreddit = (body.get("subreddit") or "").strip()
-        if not subreddit:
-            abort(400, description="subreddit is required")
-
-        limit = int(body.get("limit", 25))
-        pages = max(1, min(10, int(body.get("pages", 1))))
-
-        total_inserted = 0
-        after = None
-        for _ in range(pages):
-            posts, after = fetch_subreddit_new(subreddit, limit=limit, after=after)
-            inserted = upsert_posts(posts)
-            total_inserted += inserted
-            if not after:
-                break
-
-        return jsonify({"subreddit": subreddit, "inserted": total_inserted}), 200
-
-    # -------- Errors --------
-
+    # Error handlers
     @app.errorhandler(400)
     def bad_request(e):
         return jsonify({"error": "bad_request", "detail": e.description}), 400
@@ -342,23 +194,18 @@ def register_routes(app: Flask):
     def server_error(e):
         return jsonify({"error": "internal_server_error"}), 500
 
-
 # --------------------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------------------
 
-def parse_iso_dt(s: Optional[str]) -> Optional[datetime]:
+def parse_iso_dt(s):
     if not s:
         return None
     try:
-        # Handle both naive and tz-aware
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
-
 
 # --------------------------------------------------------------------------------------
 # WSGI
