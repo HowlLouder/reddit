@@ -11,7 +11,7 @@ from flask import (
     session, abort, jsonify
 )
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import text
+from sqlalchemy import text, inspect
 
 ###############################################################################
 # App & DB
@@ -128,26 +128,22 @@ class Post(db.Model):
 ###############################################################################
 def ensure_db_upgrade():
     """Create tables if missing and add any new columns we rely on."""
+    # Make sure base tables exist
     db.create_all()
-    # Minimal, safe 'add column if missing' for SQLite/Postgres
-    # (No-op if column already exists)
+
+    # Safely add posts.hidden if it doesn't exist (works on SQLite and Postgres)
     with db.engine.begin() as conn:
-        # posts.hidden
-        conn.execute(text("""
-            DO $$ BEGIN
-                IF NOT EXISTS (
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_name='posts' AND column_name='hidden'
-                ) THEN
-                    ALTER TABLE posts ADD COLUMN hidden BOOLEAN DEFAULT FALSE;
-                END IF;
-            EXCEPTION WHEN undefined_table THEN
-                -- Likely SQLite, try SQLite path
-                BEGIN
-                END;
-            END $$;
-        """)).execution_options(autocommit=True) if db.engine.name == "postgresql" else None
+        insp = inspect(conn)
+        if "posts" in insp.get_table_names():
+            existing_cols = {c["name"] for c in insp.get_columns("posts")}
+            if "hidden" not in existing_cols:
+                if db.engine.name == "sqlite":
+                    # SQLite can't always set defaults via ALTER reliably; just add the column.
+                    conn.execute(text("ALTER TABLE posts ADD COLUMN hidden BOOLEAN"))
+                else:
+                    # Postgres/MySQL: add with a default
+                    conn.execute(text("ALTER TABLE posts ADD COLUMN hidden BOOLEAN DEFAULT FALSE"))
+
 
         if db.engine.name == "sqlite":
             # For SQLite, check pragma table_info
