@@ -1,217 +1,88 @@
-import os
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from flask import Flask, jsonify, request, abort
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+# ... inside run_scrape, after you have subreddit_list, keyword_list:
 
-# --------------------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------------------
+results_count = 0
 
-db = SQLAlchemy()
-
-def normalize_db_url(url: str) -> str:
-    # Heroku-style URLs still show up sometimes
-    if url and url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql://", 1)
-    return url
-
-def create_app() -> Flask:
-    app = Flask(__name__)
-
-    database_url = normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///app.db"))
-    app.config["SQLALCHEMY_DATABASE_URI"] = database_url
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-    db.init_app(app)
-
-    # Defer touching the DB until the server actually receives traffic.
-    # This avoids boot-time connect() and any on_connect weirdness.
-    @app.before_first_request
-    def _create_tables_once():
-        db.create_all()
-
-    register_routes(app)
-    return app
-
-# --------------------------------------------------------------------------------------
-# Models
-# --------------------------------------------------------------------------------------
-
-class Post(db.Model):
-    __tablename__ = "posts"
-
-    id = db.Column(db.Integer, primary_key=True)
-    reddit_id = db.Column(db.String(24), unique=True, index=True, nullable=False)
-    title = db.Column(db.Text, nullable=False)
-    author = db.Column(db.String(255))
-    url = db.Column(db.Text)
-    permalink = db.Column(db.Text)
-    created_utc = db.Column(db.DateTime(timezone=True))
-    score = db.Column(db.Integer)
-    num_comments = db.Column(db.Integer)
-
-    hidden = db.Column(db.Boolean, nullable=False, default=False, server_default="0")
-
-    created_at = db.Column(
-        db.DateTime(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(timezone.utc),
-    )
-    updated_at = db.Column(
-        db.DateTime(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc),
-    )
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "reddit_id": self.reddit_id,
-            "title": self.title,
-            "author": self.author,
-            "url": self.url,
-            "permalink": self.permalink,
-            "created_utc": self.created_utc.isoformat() if self.created_utc else None,
-            "score": self.score,
-            "num_comments": self.num_comments,
-            "hidden": self.hidden,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
-
-# --------------------------------------------------------------------------------------
-# Routes
-# --------------------------------------------------------------------------------------
-
-def register_routes(app: Flask):
-
-    @app.get("/healthz")
-    def healthz():
-        try:
-            # Lightweight check that also initializes a connection only when called
-            db.session.execute(text("SELECT 1"))
-            return jsonify({"status": "ok"}), 200
-        except Exception as e:
-            return jsonify({"status": "error", "detail": str(e)}), 500
-
-    @app.get("/")
-    def root():
-        return jsonify({
-            "name": "Reddit scraper API",
-            "endpoints": {
-                "GET /healthz": "Health check",
-                "GET /posts": "List posts (query: page, per_page, include_hidden)",
-                "PATCH /posts/<id>/hide": "Hide a post",
-                "PATCH /posts/<id>/unhide": "Unhide a post",
-                "POST /posts": "Create a post (JSON body)",
-            }
-        })
-
-    @app.get("/posts")
-    def list_posts():
-        # pagination + filter
-        try:
-            page = max(1, int(request.args.get("page", 1)))
-            per_page = max(1, min(100, int(request.args.get("per_page", 20))))
-        except ValueError:
-            abort(400, description="Invalid page/per_page")
-
-        include_hidden = request.args.get("include_hidden", "false").lower() in ("1", "true", "yes")
-
-        q = Post.query
-        if not include_hidden:
-            q = q.filter_by(hidden=False)
-
-        q = q.order_by(Post.created_utc.desc().nullslast(), Post.id.desc())
-        pagination = q.paginate(page=page, per_page=per_page, error_out=False)
-
-        return jsonify({
-            "page": pagination.page,
-            "per_page": pagination.per_page,
-            "total": pagination.total,
-            "items": [p.to_dict() for p in pagination.items],
-        })
-
-    @app.post("/posts")
-    def create_post():
-        data = request.get_json(silent=True) or {}
-        for field in ("reddit_id", "title"):
-            if not data.get(field):
-                abort(400, description=f"Missing required field: {field}")
-
-        p = Post(
-            reddit_id=data["reddit_id"],
-            title=data["title"],
-            author=data.get("author"),
-            url=data.get("url"),
-            permalink=data.get("permalink"),
-            created_utc=parse_iso_dt(data.get("created_utc")),
-            score=data.get("score"),
-            num_comments=data.get("num_comments"),
-            hidden=bool(data.get("hidden", False)),
-        )
-        db.session.add(p)
-        try:
-            db.session.commit()
-        except IntegrityError:
-            db.session.rollback()
-            abort(409, description="reddit_id already exists")
-
-        return jsonify(p.to_dict()), 201
-
-    @app.patch("/posts/<int:post_id>/hide")
-    def hide_post(post_id: int):
-        p = Post.query.get_or_404(post_id)
-        p.hidden = True
-        db.session.commit()
-        return jsonify(p.to_dict())
-
-    @app.patch("/posts/<int:post_id>/unhide")
-    def unhide_post(post_id: int):
-        p = Post.query.get_or_404(post_id)
-        p.hidden = False
-        db.session.commit()
-        return jsonify(p.to_dict())
-
-    # Error handlers
-    @app.errorhandler(400)
-    def bad_request(e):
-        return jsonify({"error": "bad_request", "detail": e.description}), 400
-
-    @app.errorhandler(404)
-    def not_found(e):
-        return jsonify({"error": "not_found"}), 404
-
-    @app.errorhandler(409)
-    def conflict(e):
-        return jsonify({"error": "conflict", "detail": e.description}), 409
-
-    @app.errorhandler(500)
-    def server_error(e):
-        return jsonify({"error": "internal_server_error"}), 500
-
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
-
-def parse_iso_dt(s):
-    if not s:
-        return None
+for subreddit_name in subreddit_list:
     try:
-        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
+        subreddit = reddit.subreddit(subreddit_name)
 
-# --------------------------------------------------------------------------------------
-# WSGI
-# --------------------------------------------------------------------------------------
+        # 1) Gather matched posts (lightweight pass)
+        matched = []
+        for post in subreddit.new(limit=scrape.limit):
+            title = post.title or ""
+            body  = getattr(post, "selftext", "") or ""
+            text_all = f"{title} {body}".lower()
+            found = [kw for kw in keyword_list if kw in text_all]
+            if not found:
+                continue
 
-app = create_app()
+            url = f"https://reddit.com{post.permalink}"
+            post_id = getattr(post, "id", None) or url
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+            # skip duplicates
+            if Result.query.filter_by(scrape_id=scrape.id, reddit_post_id=post_id).first():
+                continue
+
+            matched.append({
+                "title": title,
+                "body": body,
+                "found": found,
+                "url": url,
+                "post_id": post_id,
+                "author": str(post.author),
+                "score": post.score,
+                "subreddit_name": subreddit_name
+            })
+
+        # 2) Score in parallel (only if AI enabled)
+        scored = []
+        if scrape.ai_enabled and matched:
+            def _score_item(item):
+                s, r = ai_score_post(item["title"], item["body"], item["found"], guidance=scrape.ai_guidance)
+                item["ai_score"] = s
+                item["ai_reason"] = r
+                return item
+
+            with ThreadPoolExecutor(max_workers=AI_MAX_CONCURRENCY) as ex:
+                futures = [ex.submit(_score_item, m) for m in matched]
+                for fut in as_completed(futures):
+                    scored.append(fut.result())
+        else:
+            # AI disabled => just pass through
+            for m in matched:
+                m["ai_score"] = None
+                m["ai_reason"] = "AI disabled for this scrape"
+                scored.append(m)
+
+        # 3) Persist & (optionally) send to GHL
+        for item in scored:
+            result = Result(
+                scrape_id=scrape.id,
+                title=item["title"],
+                author=item["author"],
+                subreddit=item["subreddit_name"],
+                url=item["url"],
+                score=item["score"],
+                keywords_found=",".join(item["found"]),
+                ai_score=item["ai_score"],
+                ai_reasoning=item["ai_reason"],
+                reddit_post_id=item["post_id"],
+                is_hidden=False
+            )
+            db.session.add(result)
+            results_count += 1
+
+            if scrape.ai_enabled and (item["ai_score"] or 0) >= AI_MIN_SCORE:
+                send_to_ghl({
+                    'author': item["author"],
+                    'url': item["url"],
+                    'title': item["title"],
+                    'subreddit': item["subreddit_name"],
+                    'keywords_found': item["found"]
+                })
+
+    except Exception as e:
+        log.exception("Error scraping r/%s: %s", subreddit_name, e)
+        continue
