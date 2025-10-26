@@ -1238,7 +1238,7 @@ def invite_user():
         flash("Only Agency accounts can invite users")
         return redirect(url_for('dashboard'))
 
-    if request.method == 'POST']:
+    if request.method == 'POST':
         ok, reason = can_add_user(session['user_id'])
         if not ok:
             flash(reason); return redirect(url_for('invite_user'))
