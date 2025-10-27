@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import praw
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
 import requests
@@ -344,11 +344,8 @@ def run_scrape(scrape_id):
 # ============================================================================
 @app.route('/')
 def index():
-    return jsonify({
-        'status': 'ok',
-        'service': 'Reddit Keyword Scraper',
-        'version': '2.0'
-    })
+    """Dashboard page"""
+    return render_template('index.html')
 
 
 @app.route('/scrapes', methods=['POST'])
@@ -436,6 +433,34 @@ def get_results(scrape_id):
             for r in results
         ]
     })
+
+
+@app.route('/scrapes/list', methods=['GET'])
+def list_scrapes():
+    """Get list of all scrapes"""
+    scrapes = Scrape.query.order_by(Scrape.created_at.desc()).all()
+    
+    return jsonify([
+        {
+            'id': s.id,
+            'name': s.name,
+            'status': s.status,
+            'subreddits': s.subreddits,
+            'keywords': s.keywords,
+            'ai_enabled': s.ai_enabled,
+            'results_count': s.results_count,
+            'created_at': s.created_at.isoformat(),
+            'completed_at': s.completed_at.isoformat() if s.completed_at else None
+        }
+        for s in scrapes
+    ])
+
+
+@app.route('/scrapes/<int:scrape_id>/results-page')
+def results_page(scrape_id):
+    """Results page view"""
+    scrape = Scrape.query.get_or_404(scrape_id)
+    return render_template('results.html')
 
 
 @app.route('/health', methods=['GET'])
