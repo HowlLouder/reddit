@@ -1,492 +1,1028 @@
-import os
-import logging
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import praw
-from flask import Flask, request, jsonify, render_template
+# app.py — Reddit Leads (Howl) — all-in-one
+
+from flask import Flask, request, redirect, url_for, session, flash, jsonify, abort
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import text
-import requests
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta
+from functools import wraps
+from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import text, func, case
+import praw, json, requests, os, logging
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# ------------ Flask & DB ------------
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///scraper.db')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-' + os.urandom(16).hex())
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', '').replace('postgres://', 'postgresql://')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
 db = SQLAlchemy(app)
 
-# Logging setup
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+# ------------ Logging ------------
+logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'INFO'))
+log = logging.getLogger("reddit-leads")
 
-# AI Configuration
-AI_MAX_CONCURRENCY = int(os.getenv('AI_MAX_CONCURRENCY', 5))
-AI_MIN_SCORE = int(os.getenv('AI_MIN_SCORE', 7))
-ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
+# ------------ Env Config ------------
+GHL_API_KEY      = os.environ.get('GHL_API_KEY', '')
+GHL_LOCATION_ID  = os.environ.get('GHL_LOCATION_ID', '')
+OPENAI_API_KEY   = os.environ.get('OPENAI_API_KEY', '')
+AI_MODEL         = os.environ.get('AI_MODEL', 'gpt-4o-mini')
+AI_MIN_SCORE     = int(os.environ.get('AI_MIN_SCORE', '6'))
+ENABLE_DB_ADMIN  = os.environ.get('ENABLE_DB_ADMIN', '0') == '1'
+TASKS_TOKEN      = os.environ.get('TASKS_TOKEN', '')
 
-# Reddit API Setup
-reddit = praw.Reddit(
-    client_id=os.getenv('REDDIT_CLIENT_ID', 'YOUR_CLIENT_ID'),
-    client_secret=os.getenv('REDDIT_CLIENT_SECRET', 'YOUR_CLIENT_SECRET'),
-    user_agent=os.getenv('REDDIT_USER_AGENT', 'keyword_scraper by u/YOUR_USERNAME')
-)
-
-# GHL Configuration
-GHL_WEBHOOK_URL = os.getenv('GHL_WEBHOOK_URL', '')
-
-# ============================================================================
-# DATABASE MODELS
-# ============================================================================
-class Scrape(db.Model):
-    __tablename__ = 'scrapes'
-    
+# ------------ Models ------------
+class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(200), nullable=False)
-    subreddits = db.Column(db.Text, nullable=False)  # Comma-separated
-    keywords = db.Column(db.Text, nullable=False)    # Comma-separated
-    limit = db.Column(db.Integer, default=100)
-    ai_enabled = db.Column(db.Boolean, default=False)
-    ai_guidance = db.Column(db.Text, nullable=True)
-    status = db.Column(db.String(50), default='pending')  # pending, running, completed, failed
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(200), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    completed_at = db.Column(db.DateTime, nullable=True)
-    results_count = db.Column(db.Integer, default=0)
-    
-    results = db.relationship('Result', backref='scrape', lazy=True, cascade='all, delete-orphan')
 
+class Scrape(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    subreddits = db.Column(db.Text, nullable=False)
+    keywords = db.Column(db.Text, nullable=False)
+    limit = db.Column(db.Integer, default=50)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_run = db.Column(db.DateTime)
+    is_active = db.Column(db.Boolean, default=True)
+    # Per-scrape AI configuration
+    ai_guidance = db.Column(db.Text)                     # optional guidance for AI
+    ai_enabled  = db.Column(db.Boolean, default=True)    # allow turning AI off per-scrape
 
 class Result(db.Model):
-    __tablename__ = 'results'
-    
     id = db.Column(db.Integer, primary_key=True)
-    scrape_id = db.Column(db.Integer, db.ForeignKey('scrapes.id'), nullable=False)
-    reddit_post_id = db.Column(db.String(50), nullable=False)
+    scrape_id = db.Column(db.Integer, db.ForeignKey('scrape.id'), nullable=False)
     title = db.Column(db.Text, nullable=False)
     author = db.Column(db.String(100))
     subreddit = db.Column(db.String(100))
     url = db.Column(db.Text)
-    score = db.Column(db.Integer, default=0)
-    keywords_found = db.Column(db.Text)  # Comma-separated
-    ai_score = db.Column(db.Integer, nullable=True)
-    ai_reasoning = db.Column(db.Text, nullable=True)
-    is_hidden = db.Column(db.Boolean, default=False)
+    score = db.Column(db.Integer)  # Reddit upvotes
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    # Unique constraint to prevent duplicate posts per scrape
-    __table_args__ = (
-        db.UniqueConstraint('scrape_id', 'reddit_post_id', name='unique_scrape_post'),
+    keywords_found = db.Column(db.Text)
+    # AI fields
+    ai_score = db.Column(db.Integer)       # 1..10 (nullable when AI disabled)
+    ai_reasoning = db.Column(db.Text)
+    # dedupe
+    reddit_post_id = db.Column(db.String(50))
+    # archive / hide
+    is_hidden = db.Column(db.Boolean, default=False)
+
+# --- Auto-migration: ensure columns/indexes exist (runs at import) ---
+def ensure_db_upgrade():
+    try:
+        with app.app_context():
+            db.create_all()  # base tables
+            # result table upgrades
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS ai_score SMALLINT;"))
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS ai_reasoning TEXT;"))
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS reddit_post_id TEXT;"))
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN;"))
+            db.session.execute(text("UPDATE result SET is_hidden = FALSE WHERE is_hidden IS NULL;"))
+            db.session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uniq_result_scrape_post ON result (scrape_id, reddit_post_id);"))
+            db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_result_scrape_hidden_created ON result (scrape_id, is_hidden, created_at DESC);"))
+            # scrape table upgrades
+            db.session.execute(text("ALTER TABLE scrape ADD COLUMN IF NOT EXISTS ai_guidance TEXT;"))
+            db.session.execute(text("ALTER TABLE scrape ADD COLUMN IF NOT EXISTS ai_enabled BOOLEAN;"))
+            db.session.execute(text("UPDATE scrape SET ai_enabled = TRUE WHERE ai_enabled IS NULL;"))
+            db.session.commit()
+            print("✅ DB upgrade ensured.")
+    except Exception as e:
+        db.session.rollback()
+        print("⚠️ DB upgrade error:", e)
+
+ensure_db_upgrade()
+
+# ------------ Helpers ------------
+def get_reddit_instance():
+    return praw.Reddit(
+        client_id=os.environ.get('REDDIT_CLIENT_ID', ''),
+        client_secret=os.environ.get('REDDIT_CLIENT_SECRET', ''),
+        user_agent="howl-reddit-leads"
     )
 
+def login_required(f):
+    @wraps(f)
+    def inner(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return inner
 
-# ============================================================================
-# AI SCORING FUNCTION
-# ============================================================================
-def ai_score_post(title, body, keywords_found, guidance=""):
-    """
-    Score a Reddit post using Claude API
-    Returns: (score: int, reasoning: str)
-    """
-    if not ANTHROPIC_API_KEY:
-        log.warning("No Anthropic API key configured")
-        return None, "No API key configured"
-    
-    try:
-        prompt = f"""You are analyzing a Reddit post for lead quality. 
-        
-Title: {title}
-Body: {body[:500]}  # Truncate long posts
-Keywords found: {', '.join(keywords_found)}
-
-{f'Additional guidance: {guidance}' if guidance else ''}
-
-Rate this post from 1-10 based on:
-- How relevant it is to the keywords
-- Whether it represents a genuine lead/opportunity
-- Quality and seriousness of the post
-
-Respond in this exact format:
-SCORE: [number 1-10]
-REASON: [brief explanation]"""
-
-        response = requests.post(
-            'https://api.anthropic.com/v1/messages',
-            headers={
-                'x-api-key': ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01',
-                'content-type': 'application/json',
-            },
-            json={
-                'model': 'claude-sonnet-4-20250514',
-                'max_tokens': 300,
-                'messages': [
-                    {'role': 'user', 'content': prompt}
-                ]
-            },
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            log.error(f"Anthropic API error: {response.status_code} - {response.text}")
-            return None, f"API error: {response.status_code}"
-        
-        content = response.json()['content'][0]['text']
-        
-        # Parse response
-        score_line = [line for line in content.split('\n') if line.startswith('SCORE:')]
-        reason_line = [line for line in content.split('\n') if line.startswith('REASON:')]
-        
-        if score_line and reason_line:
-            score = int(score_line[0].replace('SCORE:', '').strip())
-            reason = reason_line[0].replace('REASON:', '').strip()
-            return score, reason
-        else:
-            return None, "Could not parse AI response"
-            
-    except Exception as e:
-        log.exception(f"Error in AI scoring: {e}")
-        return None, f"Error: {str(e)}"
-
-
-# ============================================================================
-# GHL INTEGRATION
-# ============================================================================
-def send_to_ghl(data):
-    """
-    Send lead data to Go High Level webhook
-    """
-    if not GHL_WEBHOOK_URL:
-        log.warning("No GHL webhook URL configured")
+def send_to_ghl(result_data):
+    if not GHL_API_KEY or not GHL_LOCATION_ID:
         return False
-    
     try:
+        headers = {'Authorization': f'Bearer {GHL_API_KEY}', 'Content-Type': 'application/json'}
+        tags = result_data.get('keywords_found', [])
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(',') if t.strip()]
         payload = {
-            'author': data.get('author'),
-            'url': data.get('url'),
-            'title': data.get('title'),
-            'subreddit': data.get('subreddit'),
-            'keywords': ', '.join(data.get('keywords_found', [])),
-            'timestamp': datetime.utcnow().isoformat()
+            'locationId': GHL_LOCATION_ID,
+            'firstName': result_data.get('author', 'Reddit User'),
+            'source': 'Reddit Scraper',
+            'tags': tags,
+            'customFields': {
+                'reddit_post_url': result_data.get('url', ''),
+                'reddit_title': result_data.get('title', ''),
+                'subreddit': result_data.get('subreddit', '')
+            }
         }
-        
-        response = requests.post(GHL_WEBHOOK_URL, json=payload, timeout=10)
-        
-        if response.status_code == 200:
-            log.info(f"Successfully sent to GHL: {data.get('url')}")
-            return True
-        else:
-            log.error(f"GHL webhook error: {response.status_code}")
-            return False
-            
+        resp = requests.post('https://rest.gohighlevel.com/v1/contacts/', headers=headers, json=payload, timeout=15)
+        ok = 200 <= resp.status_code < 300
+        if not ok:
+            log.warning("GHL send failed: %s %s", resp.status_code, resp.text[:300])
+        return ok
     except Exception as e:
-        log.exception(f"Error sending to GHL: {e}")
+        log.exception("GHL error: %s", e)
         return False
 
-
-# ============================================================================
-# MAIN SCRAPING FUNCTION
-# ============================================================================
-def run_scrape(scrape_id):
-    """
-    Execute a scrape job - THIS IS WHERE YOUR CODE SHOULD BE!
-    This function runs when triggered, not at module import time.
-    """
-    scrape = Scrape.query.get(scrape_id)
-    if not scrape:
-        log.error(f"Scrape ID {scrape_id} not found")
-        return
-    
+def ai_score_post(title: str, body: str, keywords: list[str], guidance: str | None = None) -> tuple[int, str]:
+    """Return (score, reason). If unavailable, (0, 'AI unavailable')."""
+    if not OPENAI_API_KEY:
+        return 0, "AI disabled (missing OPENAI_API_KEY)"
     try:
-        # Update status
-        scrape.status = 'running'
-        db.session.commit()
-        
-        # Parse subreddits and keywords
-        subreddit_list = [s.strip() for s in scrape.subreddits.split(',') if s.strip()]
-        keyword_list = [k.strip().lower() for k in scrape.keywords.split(',') if k.strip()]
-        
-        if not subreddit_list or not keyword_list:
-            raise ValueError("Subreddits and keywords are required")
-        
-        log.info(f"Starting scrape {scrape.id}: {len(subreddit_list)} subreddits, {len(keyword_list)} keywords")
-        
-        results_count = 0
-        
-        # ====================================================================
-        # YOUR SCRAPING CODE STARTS HERE (NOW INSIDE A FUNCTION!)
-        # ====================================================================
-        for subreddit_name in subreddit_list:
-            try:
-                subreddit = reddit.subreddit(subreddit_name)
-                log.info(f"Scraping r/{subreddit_name}...")
-                
-                # 1) Gather matched posts (lightweight pass)
-                matched = []
-                for post in subreddit.new(limit=scrape.limit):
-                    title = post.title or ""
-                    body = getattr(post, "selftext", "") or ""
-                    text_all = f"{title} {body}".lower()
-                    found = [kw for kw in keyword_list if kw in text_all]
-                    
-                    if not found:
-                        continue
-                    
-                    url = f"https://reddit.com{post.permalink}"
-                    post_id = getattr(post, "id", None) or url
-                    
-                    # Skip duplicates
-                    if Result.query.filter_by(scrape_id=scrape.id, reddit_post_id=post_id).first():
-                        log.debug(f"Skipping duplicate post: {post_id}")
-                        continue
-                    
-                    matched.append({
-                        "title": title,
-                        "body": body,
-                        "found": found,
-                        "url": url,
-                        "post_id": post_id,
-                        "author": str(post.author),
-                        "score": post.score,
-                        "subreddit_name": subreddit_name
-                    })
-                
-                log.info(f"Found {len(matched)} matching posts in r/{subreddit_name}")
-                
-                # 2) Score in parallel (only if AI enabled)
-                scored = []
-                if scrape.ai_enabled and matched:
-                    log.info(f"AI scoring {len(matched)} posts with {AI_MAX_CONCURRENCY} workers...")
-                    
-                    def _score_item(item):
-                        s, r = ai_score_post(
-                            item["title"], 
-                            item["body"], 
-                            item["found"], 
-                            guidance=scrape.ai_guidance
-                        )
-                        item["ai_score"] = s
-                        item["ai_reason"] = r
-                        return item
-                    
-                    with ThreadPoolExecutor(max_workers=AI_MAX_CONCURRENCY) as ex:
-                        futures = [ex.submit(_score_item, m) for m in matched]
-                        for fut in as_completed(futures):
-                            try:
-                                scored.append(fut.result())
-                            except Exception as e:
-                                log.exception(f"Error scoring post: {e}")
-                else:
-                    # AI disabled => just pass through
-                    for m in matched:
-                        m["ai_score"] = None
-                        m["ai_reason"] = "AI disabled for this scrape"
-                        scored.append(m)
-                
-                # 3) Persist & (optionally) send to GHL
-                for item in scored:
-                    result = Result(
-                        scrape_id=scrape.id,
-                        title=item["title"],
-                        author=item["author"],
-                        subreddit=item["subreddit_name"],
-                        url=item["url"],
-                        score=item["score"],
-                        keywords_found=",".join(item["found"]),
-                        ai_score=item["ai_score"],
-                        ai_reasoning=item["ai_reason"],
-                        reddit_post_id=item["post_id"],
-                        is_hidden=False
-                    )
-                    db.session.add(result)
-                    results_count += 1
-                    
-                    # Send high-scoring posts to GHL
-                    if scrape.ai_enabled and (item["ai_score"] or 0) >= AI_MIN_SCORE:
-                        send_to_ghl({
-                            'author': item["author"],
-                            'url': item["url"],
-                            'title': item["title"],
-                            'subreddit': item["subreddit_name"],
-                            'keywords_found': item["found"]
-                        })
-                
-                # Commit after each subreddit
-                db.session.commit()
-                log.info(f"Completed r/{subreddit_name}: {len(scored)} results saved")
-                
-            except Exception as e:
-                log.exception(f"Error scraping r/{subreddit_name}: {e}")
-                db.session.rollback()
-                continue
-        
-        # ====================================================================
-        # YOUR SCRAPING CODE ENDS HERE
-        # ====================================================================
-        
-        # Update scrape status
-        scrape.status = 'completed'
-        scrape.completed_at = datetime.utcnow()
-        scrape.results_count = results_count
-        db.session.commit()
-        
-        log.info(f"✅ Scrape {scrape.id} completed successfully: {results_count} total results")
-        
+        guidance_text = (guidance or "").strip()
+        prompt = f"""
+You are scoring Reddit posts for lead intent. A high-quality lead means the author is asking for help, hiring, seeking services, requesting recommendations, or describing a solvable pain where outreach is welcome.
+
+If GUIDANCE is provided, bias your judgment toward that use-case and weigh relevance accordingly.
+
+GUIDANCE (optional):
+{guidance_text if guidance_text else "(none)"}
+
+Score from 1-10:
+- 9-10: Direct ask for help/hiring in scope
+- 7-8: Strong buying signals or urgent pain in scope
+- 4-6: Vague interest/learning; maybe relevant but weak
+- 1-3: Not a lead or out-of-scope
+
+Return STRICT JSON with fields: score (int 1-10), reason (<= 240 chars). No extra text.
+
+Title: {title}
+Body: {(body or '')[:1500]}
+Matched keywords: {", ".join(keywords)}
+        """.strip()
+
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": AI_MODEL,
+            "messages": [
+                {"role": "system", "content": "You are a concise lead-qualification assistant."},
+                {"role": "user",   "content": prompt},
+            ],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"}
+        }
+        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=20)
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        j = json.loads(content)
+        score = int(j.get("score", 0))
+        reason = str(j.get("reason", ""))[:1000]
+        score = max(1, min(10, score))
+        return score, reason
     except Exception as e:
-        log.exception(f"Fatal error in scrape {scrape_id}: {e}")
-        scrape.status = 'failed'
-        db.session.commit()
-        raise
+        log.warning("AI scoring error: %s", e)
+        return 0, "AI unavailable"
 
+def badge_for_status(is_active: bool) -> str:
+    return '<span class="badge text-bg-success">Active</span>' if is_active else '<span class="badge text-bg-secondary">Paused</span>'
 
-# ============================================================================
-# FLASK ROUTES
-# ============================================================================
+def score_badge(score) -> str:
+    if score is None:
+        return '<span class="badge text-bg-secondary">—</span>'
+    try:
+        s = int(score)
+    except:
+        return '<span class="badge text-bg-secondary">—</span>'
+    if s >= 9:  return f'<span class="badge text-bg-success">{s}</span>'
+    if s >= 7:  return f'<span class="badge text-bg-warning">{s}</span>'
+    return f'<span class="badge text-bg-danger">{s}</span>'
+
+# ---------- Metrics helpers ----------
+def kpis_for_user(user_id: int, days: int = 7, min_score: int = None):
+    min_score = AI_MIN_SCORE if min_score is None else min_score
+    since = datetime.utcnow() - timedelta(days=days)
+
+    total_scrapes = db.session.query(func.count(Scrape.id)).filter_by(user_id=user_id).scalar() or 0
+    active_scrapes = db.session.query(func.count(Scrape.id)).filter_by(user_id=user_id, is_active=True).scalar() or 0
+
+    res_base = db.session.query(Result.id).join(Scrape, Result.scrape_id == Scrape.id)\
+        .filter(Scrape.user_id == user_id, Result.created_at >= since)\
+        .filter((Result.is_hidden == False) | (Result.is_hidden == None))
+    total_results = res_base.count()
+
+    qualified = db.session.query(Result.id).join(Scrape, Result.scrape_id == Scrape.id)\
+        .filter(Scrape.user_id == user_id, Result.created_at >= since)\
+        .filter((Result.is_hidden == False) | (Result.is_hidden == None))\
+        .filter(Result.ai_score >= min_score).count()
+
+    return {"total_scrapes": total_scrapes, "active_scrapes": active_scrapes,
+            "total_results": total_results, "qualified": qualified, "since": since}
+
+def daily_counts(user_id: int, days: int = 7):
+    since = datetime.utcnow() - timedelta(days=days-1)
+    rows = db.session.query(
+        func.date_trunc('day', Result.created_at).label('d'),
+        func.count(Result.id),
+        func.sum(case((Result.ai_score >= AI_MIN_SCORE, 1), else_=0))
+    ).join(Scrape, Result.scrape_id == Scrape.id)\
+     .filter(Scrape.user_id == user_id, Result.created_at >= since)\
+     .filter((Result.is_hidden == False) | (Result.is_hidden == None))\
+     .group_by('d').order_by('d').all()
+
+    by_day = {r[0].date(): (int(r[1]), int(r[2] or 0)) for r in rows}
+    labels, totals, quals = [], [], []
+    for i in range(days):
+        day = (since.date() + timedelta(days=i))
+        t, q = by_day.get(day, (0, 0))
+        labels.append(day.strftime('%b %d')); totals.append(t); quals.append(q)
+    return labels, totals, quals
+
+# ---------- Theming shell (Bootstrap + Icons + Chart.js) ----------
+BOOTSTRAP_SHELL = """
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+<style>
+  /* Brand Palette */
+  :root {
+    --brand-primary: #ffb000;   /* amber */
+    --brand-navy:    #04004f;   /* deep navy */
+    --brand-bg-dark: #0f1028;   /* charcoal */
+    --brand-cyan:    #04a8d2;   /* cyan accent */
+    --brand-purple:  #8E24C1;   /* purple accent */
+
+    /* Semantic tokens (light defaults; overridden for dark below) */
+    --bg: #ffffff;
+    --panel: #ffffff;
+    --muted: #475569;
+    --text: #0f172a;
+    --border: #e2e8f0;
+    --table-head: #f1f5f9;
+
+    --btn-outline: var(--text);
+    --link: var(--brand-navy);
+    --card-shadow: rgba(0,0,0,.08);
+  }
+
+  [data-theme="dark"]{
+    --bg: var(--brand-bg-dark);
+    --panel: #0e141b;
+    --muted: #97a6b8;
+    --text: #e5eef7;
+    --border: #1c2733;
+    --table-head: #121a23;
+
+    --btn-outline: #e5eef7;
+    --link: #8ab4ff;
+    --card-shadow: rgba(0,0,0,.35);
+  }
+
+  html, body{height:100%}
+  body{background:var(--bg); color:var(--text)}
+  a{color:var(--link)}
+
+  .navbar{background:var(--panel); border-bottom:1px solid var(--border)}
+  .card{background:var(--panel); border:1px solid var(--border); box-shadow: 0 6px 20px var(--card-shadow)}
+  .muted{color:var(--muted)}
+
+  .table{
+    --bs-table-color: var(--text);
+    --bs-table-bg: transparent;
+    --bs-table-border-color: var(--border);
+  }
+  .table thead{background:var(--table-head)}
+
+  .badge.text-bg-success{background:#16a34a!important}
+  .badge.text-bg-warning{background:#f59e0b!important; color:#0b0f14}
+  .badge.text-bg-danger{background:#ef4444!important}
+
+  .btn-primary{
+    background:var(--brand-primary);
+    border-color:var(--brand-primary);
+    color:#1f2937;
+  }
+  .btn-primary:hover{filter:brightness(0.95)}
+  .btn-outline-light, .btn-outline-dark, .btn-outline-primary, .btn-outline-secondary,
+  .btn-outline-warning, .btn-outline-danger, .btn-outline-info{
+    border-color: var(--btn-outline);
+    color: var(--btn-outline);
+  }
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+"""
+
+def page_wrap(inner_html: str, page_title: str = "") -> str:
+    title = f"{page_title} – Reddit Scraper" if page_title else "Reddit Scraper"
+    theme = session.get("theme", "dark")
+    toggle_label = "Light Mode" if theme == "dark" else "Dark Mode"
+    return f"""{BOOTSTRAP_SHELL}
+<title>{title}</title>
+<body data-theme="{theme}">
+<nav class="navbar navbar-expand-lg">
+  <div class="container-fluid">
+    <a class="navbar-brand fw-semibold" style="color:var(--brand-primary)" href="/dashboard">
+      <i class="bi bi-rocket-takeoff"></i> Reddit Leads
+    </a>
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#nav" aria-controls="nav" aria-expanded="false">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+    <div id="nav" class="collapse navbar-collapse">
+      <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+        <li class="nav-item"><a class="nav-link" style="color:var(--text)" href="/dashboard">Dashboard</a></li>
+        <li class="nav-item"><a class="nav-link" style="color:var(--text)" href="/create-scrape">New Scrape</a></li>
+      </ul>
+      <a class="btn btn-sm btn-outline-light me-2" href="/theme/toggle"><i class="bi bi-moon-stars"></i> {toggle_label}</a>
+      <span class="muted me-3">Hi, {session.get("username","guest")}</span>
+      {'<a class="btn btn-outline-light btn-sm" href="/logout">Logout</a>' if session.get('user_id') else '<a class="btn btn-outline-light btn-sm" href="/login">Login</a>'}
+    </div>
+  </div>
+</nav>
+
+<div class="container py-4">{inner_html}</div>
+</body>
+"""
+
+@app.route('/theme/<mode>')
+def set_theme(mode):
+    cur = session.get("theme", "dark")
+    if mode == "toggle":
+        session["theme"] = "light" if cur == "dark" else "dark"
+    elif mode in ("dark", "light"):
+        session["theme"] = mode
+    return redirect(request.referrer or url_for('dashboard'))
+
+# ------------ Scraper core ------------
+def run_scrape(scrape_id):
+    with app.app_context():
+        scrape = Scrape.query.get(scrape_id)
+        if not scrape or not scrape.is_active:
+            return
+        try:
+            reddit = get_reddit_instance()
+            subreddit_list = [s.strip() for s in scrape.subreddits.split(',') if s.strip()]
+            keyword_list  = [k.strip().lower() for k in scrape.keywords.split(',') if k.strip()]
+
+            results_count = 0
+            for subreddit_name in subreddit_list:
+                try:
+                    subreddit = reddit.subreddit(subreddit_name)
+                    for post in subreddit.new(limit=scrape.limit):
+                        title = post.title or ""
+                        body  = getattr(post, "selftext", "") or ""
+                        text_all = f"{title} {body}".lower()
+                        found = [kw for kw in keyword_list if kw in text_all]
+                        if not found:
+                            continue
+
+                        url = f"https://reddit.com{post.permalink}"
+                        post_id = getattr(post, "id", None) or url
+
+                        if Result.query.filter_by(scrape_id=scrape.id, reddit_post_id=post_id).first():
+                            continue
+
+                        # --- AI scoring (optional) ---
+                        if scrape.ai_enabled:
+                            ai_score_val, ai_reason = ai_score_post(title, body, found, guidance=scrape.ai_guidance)
+                        else:
+                            ai_score_val, ai_reason = None, "AI disabled for this scrape"
+
+                        result = Result(
+                            scrape_id=scrape.id,
+                            title=title,
+                            author=str(post.author),
+                            subreddit=subreddit_name,
+                            url=url,
+                            score=post.score,
+                            keywords_found=','.join(found),
+                            ai_score=ai_score_val,
+                            ai_reasoning=ai_reason,
+                            reddit_post_id=post_id,
+                            is_hidden=False
+                        )
+                        db.session.add(result)
+                        results_count += 1
+
+                        # Auto-send only when AI is ON and meets threshold
+                        if scrape.ai_enabled and (ai_score_val or 0) >= AI_MIN_SCORE:
+                            send_to_ghl({
+                                'author': str(post.author),
+                                'url': url,
+                                'title': title,
+                                'subreddit': subreddit_name,
+                                'keywords_found': found
+                            })
+
+                except Exception as e:
+                    log.exception("Error scraping r/%s: %s", subreddit_name, e)
+                    continue
+
+            scrape.last_run = datetime.utcnow()
+            db.session.commit()
+            log.info("Scrape %s completed. New results: %s", scrape.id, results_count)
+        except Exception as e:
+            log.exception("Error running scrape %s: %s", scrape_id, e)
+            db.session.rollback()
+
+def run_all_scrapes():
+    with app.app_context():
+        for s in Scrape.query.filter_by(is_active=True).all():
+            run_scrape(s.id)
+
+# ------------ Auth & basic pages ------------
+@app.route('/init-db')
+def init_db():
+    if not ENABLE_DB_ADMIN:
+        abort(404)
+    try:
+        db.create_all()
+        if not User.query.filter_by(username='admin').first():
+            admin = User(username='admin', email='admin@example.com',
+                         password_hash=generate_password_hash('admin123'), is_admin=True)
+            db.session.add(admin); db.session.commit()
+        return "Database initialized!"
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/reset-db')
+def reset_db():
+    if not ENABLE_DB_ADMIN:
+        abort(404)
+    try:
+        db.drop_all(); db.create_all()
+        admin = User(username='admin', email='admin@example.com',
+                     password_hash=generate_password_hash('admin123'), is_admin=True)
+        db.session.add(admin); db.session.commit()
+        return "Database reset!"
+    except Exception as e:
+        return f"Error: {e}"
+
 @app.route('/')
 def index():
-    """Dashboard page"""
-    return render_template('index.html')
+    if 'user_id' in session:
+        return redirect(url_for('dashboard'))
+    html = '''
+      <h1 class="mb-2">Reddit Scraper Platform</h1>
+      <p class="muted">Monitor Reddit for keywords and push qualified leads to GoHighLevel.</p>
+      <a class="btn btn-primary me-2" href="/login">Login</a>
+      <a class="btn btn-outline-light" href="/register">Register</a>
+    '''
+    return page_wrap(html, "Home")
 
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        u = request.form['username'].strip()
+        e = request.form['email'].strip()
+        p = request.form['password']
+        if User.query.filter_by(username=u).first():
+            flash('Username already exists'); return redirect(url_for('register'))
+        user = User(username=u, email=e, password_hash=generate_password_hash(p))
+        db.session.add(user); db.session.commit()
+        flash('Account created!'); return redirect(url_for('login'))
+    html = '''
+      <h2 class="mb-3">Register</h2>
+      <form method="POST" class="card card-body" style="max-width:520px">
+        <input class="form-control mb-2" type="text" name="username" placeholder="Username" required>
+        <input class="form-control mb-2" type="email" name="email" placeholder="Email" required>
+        <input class="form-control mb-3" type="password" name="password" placeholder="Password" required>
+        <button class="btn btn-primary" type="submit">Sign Up</button>
+      </form>
+      <a class="d-inline-block mt-3" href="/">Back</a>
+    '''
+    return page_wrap(html, "Register")
 
-@app.route('/scrapes', methods=['POST'])
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        u = request.form['username'].strip(); p = request.form['password']
+        user = User.query.filter_by(username=u).first()
+        if user and check_password_hash(user.password_hash, p):
+            session['user_id'] = user.id; session['username'] = user.username
+            return redirect(url_for('dashboard'))
+        flash('Invalid credentials')
+    html = '''
+      <h2 class="mb-3">Login</h2>
+      <form method="POST" class="card card-body" style="max-width:520px">
+        <input class="form-control mb-2" type="text" name="username" placeholder="Username" required>
+        <input class="form-control mb-3" type="password" name="password" placeholder="Password" required>
+        <button class="btn btn-primary" type="submit">Login</button>
+      </form>
+      <a class="d-inline-block mt-3" href="/register">Sign Up</a>
+    '''
+    return page_wrap(html, "Login")
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('index'))
+
+# ------------ Dashboard (metrics + chart + recent + scrapes) ------------
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    user_id = session['user_id']
+    kpis = kpis_for_user(user_id, days=7)
+    labels, totals, quals = daily_counts(user_id, days=7)
+
+    recent = db.session.query(Result, Scrape).join(Scrape, Result.scrape_id == Scrape.id)\
+        .filter(Scrape.user_id == user_id)\
+        .filter((Result.is_hidden == False) | (Result.is_hidden == None))\
+        .order_by(Result.created_at.desc()).limit(10).all()
+
+    cards = f"""
+    <div class="row g-3">
+      <div class="col-6 col-md-3">
+        <div class="card p-3">
+          <div class="muted">Scrapes</div>
+          <div class="fs-3 fw-bold">{kpis['total_scrapes']}</div>
+          <div class="muted"><i class="bi bi-circle-fill text-success me-1"></i>{kpis['active_scrapes']} active</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card p-3">
+          <div class="muted">Results (7d)</div>
+          <div class="fs-3 fw-bold">{kpis['total_results']}</div>
+          <div class="muted">since {kpis['since'].strftime('%b %d')}</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card p-3">
+          <div class="muted">Qualified ≥ {AI_MIN_SCORE} (7d)</div>
+          <div class="fs-3 fw-bold">{kpis['qualified']}</div>
+          <div class="muted">auto-sent to GHL</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card p-3">
+          <div class="muted">AI Threshold</div>
+          <div class="fs-3 fw-bold">{AI_MIN_SCORE}</div>
+          <div class="muted">set via AI_MIN_SCORE</div>
+        </div>
+      </div>
+    </div>
+    """
+
+    chart = f"""
+    <div class="card mt-4 p-3">
+      <div class="d-flex justify-content-between align-items-center">
+        <h5 class="mb-0">Leads over last 7 days</h5>
+      </div>
+      <canvas id="leadsChart" height="120" class="mt-3"></canvas>
+    </div>
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {{
+      const ctx = document.getElementById('leadsChart');
+      new Chart(ctx, {{
+        type: 'line',
+        data: {{
+          labels: {json.dumps(labels)},
+          datasets: [
+            {{ label: 'Total matches', data: {json.dumps(totals)}, borderWidth: 2, tension: .25 }},
+            {{ label: 'Qualified (AI)', data: {json.dumps(quals)}, borderWidth: 2, borderDash: [5,5], tension: .25 }}
+          ]
+        }},
+        options: {{
+          plugins: {{ legend: {{ labels: {{ color: getComputedStyle(document.body).getPropertyValue('--text').trim() }} }} }},
+          scales: {{
+            x: {{ ticks: {{ color: getComputedStyle(document.body).getPropertyValue('--muted').trim() }},
+                  grid:  {{ color: getComputedStyle(document.body).getPropertyValue('--border').trim() }} }},
+            y: {{ ticks: {{ color: getComputedStyle(document.body).getPropertyValue('--muted').trim() }},
+                  grid:  {{ color: getComputedStyle(document.body).getPropertyValue('--border').trim() }}, beginAtZero: true }}
+          }}
+        }}
+      }});
+    }});
+    </script>
+    """
+
+    # Recent results
+    recent_rows = ""
+    for r, s in recent:
+        badge = score_badge(r.ai_score)
+        actions = [f'<a class="btn btn-sm btn-outline-primary" target="_blank" href="{r.url}">Open</a>']
+        if (r.ai_score or 0) < AI_MIN_SCORE:
+            actions.append(f'<a class="btn btn-sm btn-outline-success" href="/send-to-ghl/{r.id}">Send</a>')
+        if r.is_hidden:
+            actions.append(f'<a class="btn btn-sm btn-outline-secondary" href="/result/{r.id}/unhide">Unhide</a>')
+        else:
+            actions.append(f'<a class="btn btn-sm btn-outline-danger" href="/result/{r.id}/hide">Hide</a>')
+        recent_rows += f"""
+        <tr>
+          <td>{r.created_at.strftime('%Y-%m-%d %H:%M')}</td>
+          <td><span class="muted">r/</span>{r.subreddit}</td>
+          <td>{(r.title or '')[:80]}{'...' if (r.title and len(r.title)>80) else ''}</td>
+          <td>{badge}</td>
+          <td class="text-nowrap">{' '.join(actions)}</td>
+        </tr>
+        """
+
+    recent_table = f"""
+    <div class="card mt-4 p-3">
+      <div class="d-flex justify-content-between align-items-center">
+        <h5 class="mb-0">Recent results</h5>
+      </div>
+      <div class="table-responsive mt-2">
+        <table class="table table-sm align-middle">
+          <thead>
+            <tr><th>Date</th><th>Subreddit</th><th>Title</th><th>AI</th><th>Actions</th></tr>
+          </thead>
+          <tbody>{recent_rows or '<tr><td colspan="5" class="text-center py-4">No recent results.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+    """
+
+    # Scrapes table
+    scrapes = Scrape.query.filter_by(user_id=user_id).order_by(Scrape.created_at.desc()).all()
+    scrape_rows = ""
+    for s in scrapes:
+        last_run = s.last_run.strftime('%Y-%m-%d %H:%M') if s.last_run else 'Never'
+        status_html = badge_for_status(s.is_active)
+        result_count = db.session.query(func.count(Result.id))\
+            .filter(Result.scrape_id == s.id)\
+            .filter((Result.is_hidden == False) | (Result.is_hidden == None)).scalar() or 0
+        ai_col = '<span class="badge text-bg-success">AI</span>' if (s.ai_enabled is None or s.ai_enabled) \
+                 else '<span class="badge text-bg-secondary">No AI</span>'
+        scrape_rows += f"""
+        <tr>
+          <td>{s.name}</td>
+          <td><code>{s.subreddits}</code></td>
+          <td><code>{s.keywords}</code></td>
+          <td>{ai_col}</td>
+          <td>{status_html}</td>
+          <td>{last_run}</td>
+          <td><a href="/results/{s.id}">{result_count} results</a></td>
+          <td class="text-nowrap">
+            <a class="btn btn-sm btn-outline-primary" href="/results/{s.id}">View Results</a>
+            <a class="btn btn-sm btn-outline-info" href="/edit-scrape/{s.id}">Edit</a>
+            <a class="btn btn-sm btn-outline-secondary" href="/run-scrape/{s.id}">Run</a>
+            <a class="btn btn-sm btn-outline-warning" href="/toggle-scrape/{s.id}">Toggle</a>
+            <a class="btn btn-sm btn-outline-danger" href="/delete-scrape/{s.id}" onclick="return confirm('Delete this scrape?')">Delete</a>
+          </td>
+        </tr>
+        """
+
+    scrapes_table = f"""
+    <div class="card mt-4 p-3">
+      <div class="d-flex justify-content-between align-items-center">
+        <h5 class="mb-0">Your scrapes</h5>
+        <a class="btn btn-sm btn-outline-light" href="/create-scrape"><i class="bi bi-plus"></i> New Scrape</a>
+      </div>
+      <div class="table-responsive mt-2">
+        <table class="table table-sm align-middle">
+          <thead>
+            <tr>
+              <th>Name</th><th>Subreddits</th><th>Keywords</th><th>AI</th><th>Status</th><th>Last Run</th><th>Results</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>{scrape_rows or '<tr><td colspan="8" class="text-center py-4">No scrapes yet.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+    """
+
+    return page_wrap(cards + chart + recent_table + scrapes_table, "Dashboard")
+
+# ------------ Create/Edit Scrape ------------
+@app.route('/create-scrape', methods=['GET', 'POST'])
+@login_required
 def create_scrape():
-    """Create a new scrape job"""
-    data = request.get_json()
-    
-    scrape = Scrape(
-        name=data.get('name', 'Untitled Scrape'),
-        subreddits=data.get('subreddits', ''),
-        keywords=data.get('keywords', ''),
-        limit=data.get('limit', 100),
-        ai_enabled=data.get('ai_enabled', False),
-        ai_guidance=data.get('ai_guidance', '')
-    )
-    
-    db.session.add(scrape)
+    if request.method == 'POST':
+        scrape = Scrape(
+            name=request.form['name'],
+            subreddits=request.form['subreddits'],
+            keywords=request.form['keywords'],
+            limit=int(request.form.get('limit', 50)),
+            user_id=session['user_id'],
+            ai_guidance=request.form.get('ai_guidance', ''),
+            ai_enabled=(request.form.get('ai_enabled', 'on') == 'on')  # checked by default
+        )
+        db.session.add(scrape); db.session.commit()
+        flash('Scrape created! It will run automatically every hour.')
+        return redirect(url_for('dashboard'))
+
+    html = '''
+      <h2 class="mb-3">Create New Scrape</h2>
+      <form method="POST" class="card card-body" style="max-width:720px">
+        <label class="form-label"><b>Name</b></label>
+        <input class="form-control mb-3" type="text" name="name" required>
+
+        <label class="form-label"><b>Subreddits (comma-separated)</b></label>
+        <input class="form-control mb-3" type="text" name="subreddits" placeholder="bookkeeping,smallbusiness,accounting" required>
+
+        <label class="form-label"><b>Keywords (comma-separated)</b></label>
+        <input class="form-control mb-3" type="text" name="keywords" placeholder="help,need,looking for" required>
+
+        <label class="form-label"><b>Posts to check per subreddit</b></label>
+        <input class="form-control mb-3" type="number" name="limit" value="50">
+
+        <label class="form-label"><b>AI Guidance (optional)</b></label>
+        <textarea class="form-control mb-3" name="ai_guidance" rows="4"
+          placeholder="Describe the goal for AI (e.g., 'B2B bookkeeping leads in US, ongoing monthly work. Exclude students/DIYers/job seekers.')"></textarea>
+
+        <div class="form-check mb-3">
+          <input class="form-check-input" type="checkbox" id="ai_enabled" name="ai_enabled" checked>
+          <label class="form-check-label" for="ai_enabled"><b>Use AI scoring for this scrape</b></label>
+        </div>
+
+        <button class="btn btn-primary" type="submit">Create Scrape</button>
+      </form>
+      <a class="d-inline-block mt-3" href="/dashboard">← Back to Dashboard</a>
+    '''
+    return page_wrap(html, "Create Scrape")
+
+@app.route('/edit-scrape/<int:scrape_id>', methods=['GET', 'POST'])
+@login_required
+def edit_scrape(scrape_id):
+    s = Scrape.query.get_or_404(scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        s.name = request.form['name']
+        s.subreddits = request.form['subreddits']
+        s.keywords = request.form['keywords']
+        s.limit = int(request.form.get('limit', s.limit or 50))
+        s.ai_guidance = request.form.get('ai_guidance', '')
+        s.ai_enabled = (request.form.get('ai_enabled') == 'on')
+        db.session.commit()
+        flash('Scrape updated.')
+        return redirect(url_for('dashboard'))
+
+    checked = 'checked' if (s.ai_enabled is None or s.ai_enabled) else ''
+    html = f'''
+      <h2 class="mb-3">Edit Scrape</h2>
+      <form method="POST" class="card card-body" style="max-width:720px">
+        <label class="form-label"><b>Name</b></label>
+        <input class="form-control mb-3" type="text" name="name" value="{s.name}" required>
+
+        <label class="form-label"><b>Subreddits (comma-separated)</b></label>
+        <input class="form-control mb-3" type="text" name="subreddits" value="{s.subreddits}" required>
+
+        <label class="form-label"><b>Keywords (comma-separated)</b></label>
+        <input class="form-control mb-3" type="text" name="keywords" value="{s.keywords}" required>
+
+        <label class="form-label"><b>Posts to check per subreddit</b></label>
+        <input class="form-control mb-3" type="number" name="limit" value="{s.limit or 50}">
+
+        <label class="form-label"><b>AI Guidance (optional)</b></label>
+        <textarea class="form-control mb-3" name="ai_guidance" rows="5">{(s.ai_guidance or '')}</textarea>
+
+        <div class="form-check mb-3">
+          <input class="form-check-input" type="checkbox" id="ai_enabled" name="ai_enabled" {checked}>
+          <label class="form-check-label" for="ai_enabled"><b>Use AI scoring for this scrape</b></label>
+        </div>
+
+        <button class="btn btn-primary" type="submit">Save Changes</button>
+      </form>
+      <a class="d-inline-block mt-3" href="/dashboard">← Back to Dashboard</a>
+    '''
+    return page_wrap(html, "Edit Scrape")
+
+# ------------ Results + Hide / Unhide / Bulk Hide ------------
+@app.route('/results/<int:scrape_id>')
+@login_required
+def view_results(scrape_id):
+    s = Scrape.query.get_or_404(scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+
+    try:
+        min_score = int(request.args.get('min_score', '0'))
+    except:
+        min_score = 0
+    show_hidden = request.args.get('show_hidden', '0') == '1'
+
+    q = Result.query.filter_by(scrape_id=scrape_id)
+    if not show_hidden:
+        q = q.filter((Result.is_hidden == False) | (Result.is_hidden == None))
+    if min_score:
+        q = q.filter(Result.ai_score >= min_score)
+
+    results = q.order_by(Result.created_at.desc()).all()
+
+    ai_status = f"""
+      <span class="badge {'text-bg-success' if s.ai_enabled else 'text-bg-secondary'}">
+        {'AI scoring ON' if s.ai_enabled else 'AI scoring OFF'}
+      </span>
+    """
+
+    guidance_block = f'''
+    <div class="card p-3 mb-3">
+      <div class="d-flex justify-content-between align-items-start">
+        <div>
+          <div class="muted">AI Guidance</div>
+          <div>{(s.ai_guidance or "<span class='muted'>(none set)</span>")}</div>
+        </div>
+        <div>{ai_status}</div>
+      </div>
+    </div>
+    '''
+
+    toolbar = f'''
+    <div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
+      <form class="row row-cols-lg-auto g-2 align-items-center" method="GET">
+        <input type="hidden" name="show_hidden" value="{1 if show_hidden else 0}">
+        <div class="col-12">
+          <label class="form-label me-2">Min Score</label>
+          <input class="form-control form-control-sm" type="number" min="0" max="10" name="min_score" value="{min_score}">
+        </div>
+        <div class="col-12">
+          <button class="btn btn-sm btn-outline-primary" type="submit">Apply</button>
+        </div>
+      </form>
+      <div class="d-flex align-items-center gap-2">
+        <form method="GET">
+          <input type="hidden" name="min_score" value="{min_score}">
+          <input type="hidden" name="show_hidden" value="{0 if show_hidden else 1}">
+          <button class="btn btn-sm btn-outline-light" type="submit">
+            {'Hide Hidden' if show_hidden else 'Show Hidden'}
+          </button>
+        </form>
+        <form method="POST" action="/results/{s.id}/hide-below">
+          <input type="hidden" name="threshold" value="{max(min_score, AI_MIN_SCORE)}">
+          <button class="btn btn-sm btn-outline-warning" onclick="return confirm('Hide all posts below threshold?')">
+            Hide all &lt; {max(min_score, AI_MIN_SCORE)}
+          </button>
+        </form>
+        <a class="btn btn-sm btn-outline-light" href="/run-scrape/{s.id}"><i class="bi bi-arrow-repeat"></i> Run Now</a>
+        <a class="btn btn-sm btn-outline-light" href="/dashboard">Back</a>
+      </div>
+    </div>
+    '''
+
+    rows = ""
+    for r in results:
+        ai_html = f"""{score_badge(r.ai_score)}
+            {f'<div class="text-muted small">{r.ai_reasoning}</div>' if r.ai_reasoning else ''}"""
+        actions = []
+        actions.append(f'<a class="btn btn-sm btn-outline-primary" target="_blank" href="{r.url}">Open</a>')
+        if (r.ai_score or 0) < AI_MIN_SCORE:
+            actions.append(f'<a class="btn btn-sm btn-outline-success" href="/send-to-ghl/{r.id}?min_score={min_score}&show_hidden={1 if show_hidden else 0}">Send</a>')
+        if r.is_hidden:
+            actions.append(f'<a class="btn btn-sm btn-outline-secondary" href="/result/{r.id}/unhide">Unhide</a>')
+        else:
+            actions.append(f'<a class="btn btn-sm btn-outline-danger" href="/result/{r.id}/hide?min_score={min_score}&show_hidden={1 if show_hidden else 0}">Hide</a>')
+
+        hidden_tag = '<span class="badge text-bg-secondary ms-2">Hidden</span>' if r.is_hidden else ''
+        rows += f'''
+          <tr class="{'opacity-50' if r.is_hidden else ''}">
+            <td>{r.created_at.strftime('%Y-%m-%d %H:%M')}</td>
+            <td>r/{r.subreddit}</td>
+            <td>{(r.title or "")[:100]}{"..." if len(r.title or "")>100 else ""} {hidden_tag}</td>
+            <td>u/{r.author}</td>
+            <td>{r.score}</td>
+            <td><code>{r.keywords_found or ""}</code></td>
+            <td>{ai_html}</td>
+            <td class="text-nowrap">{' '.join(actions)}</td>
+          </tr>
+        '''
+
+    if not results:
+        rows = '<tr><td colspan="8" class="text-center py-4">No results for current filters.</td></tr>'
+
+    html = f'''
+      <h1 class="mb-2">Results for: {s.name}</h1>
+      {guidance_block}
+      {toolbar}
+      <table class="table table-sm align-middle">
+        <thead class="table-light">
+          <tr>
+            <th>Date</th><th>Subreddit</th><th>Title</th><th>Author</th>
+            <th>Upvotes</th><th>Keywords</th><th>AI</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
+    '''
+    return page_wrap(html, f"Results – {s.name}")
+
+@app.route('/result/<int:result_id>/hide', methods=['POST', 'GET'])
+@login_required
+def hide_result(result_id):
+    r = Result.query.get_or_404(result_id)
+    s = Scrape.query.get(r.scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+    r.is_hidden = True; db.session.commit()
+    flash('Post hidden')
+    return redirect(url_for('view_results', scrape_id=r.scrape_id, **{k: v for k, v in request.args.items()}))
+
+@app.route('/result/<int:result_id>/unhide', methods=['POST', 'GET'])
+@login_required
+def unhide_result(result_id):
+    r = Result.query.get_or_404(result_id)
+    s = Scrape.query.get(r.scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+    r.is_hidden = False; db.session.commit()
+    flash('Post unhidden')
+    return redirect(url_for('view_results', scrape_id=r.scrape_id, show_hidden=1))
+
+@app.route('/results/<int:scrape_id>/hide-below', methods=['POST'])
+@login_required
+def hide_below(scrape_id):
+    s = Scrape.query.get_or_404(scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+    try:
+        threshold = int(request.form.get('threshold', AI_MIN_SCORE))
+    except:
+        threshold = AI_MIN_SCORE
+    q = Result.query.filter_by(scrape_id=scrape_id).filter((Result.ai_score < threshold) | (Result.ai_score == None))
+    updated = q.update({Result.is_hidden: True}, synchronize_session=False)
     db.session.commit()
-    
-    return jsonify({
-        'id': scrape.id,
-        'status': 'created',
-        'message': 'Scrape job created'
-    }), 201
+    flash(f'Hidden {updated} posts below score {threshold}')
+    return redirect(url_for('view_results', scrape_id=scrape_id, show_hidden=0))
 
-
-@app.route('/scrapes/<int:scrape_id>/run', methods=['POST'])
-def trigger_scrape(scrape_id):
-    """Trigger a scrape to run"""
-    scrape = Scrape.query.get_or_404(scrape_id)
-    
-    if scrape.status == 'running':
-        return jsonify({'error': 'Scrape is already running'}), 400
-    
-    try:
-        # Run synchronously (for production, use Celery/background jobs)
-        run_scrape(scrape_id)
-        return jsonify({
-            'id': scrape.id,
-            'status': 'completed',
-            'results_count': scrape.results_count
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/scrapes/<int:scrape_id>', methods=['GET'])
-def get_scrape(scrape_id):
-    """Get scrape details"""
-    scrape = Scrape.query.get_or_404(scrape_id)
-    
-    return jsonify({
-        'id': scrape.id,
-        'name': scrape.name,
-        'status': scrape.status,
-        'subreddits': scrape.subreddits,
-        'keywords': scrape.keywords,
-        'results_count': scrape.results_count,
-        'created_at': scrape.created_at.isoformat(),
-        'completed_at': scrape.completed_at.isoformat() if scrape.completed_at else None
+# ------------ Actions ------------
+@app.route('/send-to-ghl/<int:result_id>')
+@login_required
+def send_to_ghl_manual(result_id):
+    r = Result.query.get_or_404(result_id)
+    s = Scrape.query.get(r.scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+    ok = send_to_ghl({
+        'author': r.author, 'url': r.url, 'title': r.title,
+        'subreddit': r.subreddit, 'keywords_found': (r.keywords_found or '').split(',')
     })
+    flash('Sent to GoHighLevel' if ok else 'Failed to send to GoHighLevel')
+    return redirect(url_for('view_results', scrape_id=r.scrape_id))
 
+@app.route('/run-scrape/<int:scrape_id>')
+@login_required
+def run_scrape_now(scrape_id):
+    s = Scrape.query.get_or_404(scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+    run_scrape(scrape_id)
+    flash('Scrape completed! Check results.')
+    return redirect(url_for('dashboard'))
 
-@app.route('/scrapes/<int:scrape_id>/results', methods=['GET'])
-def get_results(scrape_id):
-    """Get results for a scrape"""
-    scrape = Scrape.query.get_or_404(scrape_id)
-    results = Result.query.filter_by(scrape_id=scrape_id, is_hidden=False).all()
-    
-    return jsonify({
-        'scrape_id': scrape.id,
-        'total': len(results),
-        'results': [
-            {
-                'id': r.id,
-                'title': r.title,
-                'author': r.author,
-                'subreddit': r.subreddit,
-                'url': r.url,
-                'score': r.score,
-                'keywords_found': r.keywords_found,
-                'ai_score': r.ai_score,
-                'ai_reasoning': r.ai_reasoning
-            }
-            for r in results
-        ]
-    })
+@app.route('/toggle-scrape/<int:scrape_id>')
+@login_required
+def toggle_scrape(scrape_id):
+    s = Scrape.query.get_or_404(scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+    s.is_active = not s.is_active; db.session.commit()
+    flash(f'Scrape {"activated" if s.is_active else "paused"}')
+    return redirect(url_for('dashboard'))
 
+@app.route('/delete-scrape/<int:scrape_id>')
+@login_required
+def delete_scrape(scrape_id):
+    s = Scrape.query.get_or_404(scrape_id)
+    if s.user_id != session['user_id']:
+        flash('Access denied'); return redirect(url_for('dashboard'))
+    Result.query.filter_by(scrape_id=scrape_id).delete()
+    db.session.delete(s); db.session.commit()
+    flash('Scrape deleted')
+    return redirect(url_for('dashboard'))
 
-@app.route('/scrapes/list', methods=['GET'])
-def list_scrapes():
-    """Get list of all scrapes"""
-    scrapes = Scrape.query.order_by(Scrape.created_at.desc()).all()
-    
-    return jsonify([
-        {
-            'id': s.id,
-            'name': s.name,
-            'status': s.status,
-            'subreddits': s.subreddits,
-            'keywords': s.keywords,
-            'ai_enabled': s.ai_enabled,
-            'results_count': s.results_count,
-            'created_at': s.created_at.isoformat(),
-            'completed_at': s.completed_at.isoformat() if s.completed_at else None
-        }
-        for s in scrapes
-    ])
+# ------------ Cron webhook (optional) ------------
+@app.route('/tasks/run-all', methods=['POST'])
+def tasks_run_all():
+    if TASKS_TOKEN and request.headers.get('X-TASKS-TOKEN') != TASKS_TOKEN:
+        return "Forbidden", 403
+    run_all_scrapes()
+    return jsonify({"ok": True})
 
+# ------------ Debug ------------
+@app.route('/debug/version')
+def debug_version():
+    return "howl-ui-ai-v7-theme"
 
-@app.route('/scrapes/<int:scrape_id>/results-page')
-def results_page(scrape_id):
-    """Results page view"""
-    scrape = Scrape.query.get_or_404(scrape_id)
-    return render_template('results.html')
+@app.route('/debug/ai')
+def debug_ai():
+    score, reason = ai_score_post(
+        "Need a bookkeeper for my small business",
+        "Looking for ongoing monthly bookkeeping and payroll.",
+        ["need","bookkeeper","looking"],
+        guidance="B2B bookkeeping leads, monthly recurring"
+    )
+    return jsonify({"score": score, "reason": reason})
 
+# ------------ Scheduler ------------
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=run_all_scrapes, trigger="interval", hours=1)
+scheduler.start()
 
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
-    try:
-        # Test database connection
-        db.session.execute(text('SELECT 1'))
-        return jsonify({'status': 'healthy', 'database': 'connected'})
-    except Exception as e:
-        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
-
-
-# ============================================================================
-# DATABASE INITIALIZATION
-# ============================================================================
-def init_db():
-    """Initialize database tables"""
+# ------------ Local run ------------
+if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-        log.info("Database tables created")
-
-
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
-if __name__ == '__main__':
-    init_db()
-    app.run(host='0.0.0.0', port=8080, debug=True)
+        if not User.query.filter_by(username='admin').first():
+            admin = User(username='admin', email='admin@example.com',
+                         password_hash=generate_password_hash('admin123'), is_admin=True)
+            db.session.add(admin); db.session.commit()
+    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
