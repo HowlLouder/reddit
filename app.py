@@ -80,6 +80,9 @@ class UserProfile(db.Model):
     description = db.Column(db.Text)
     services = db.Column(db.Text)
     tone = db.Column(db.String(200))
+    website_url = db.Column(db.String(500))
+    website_cache = db.Column(db.Text)
+    website_cached_at = db.Column(db.DateTime)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class ProfileFile(db.Model):
@@ -112,6 +115,10 @@ def ensure_db_upgrade():
             db.session.execute(text("UPDATE scrape SET scrape_type = 'lead' WHERE scrape_type IS NULL;"))
             # result table - new columns
             db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS suggested_response TEXT;"))
+            # user_profile table - website columns
+            db.session.execute(text("ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS website_url VARCHAR(500);"))
+            db.session.execute(text("ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS website_cache TEXT;"))
+            db.session.execute(text("ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS website_cached_at TIMESTAMP;"))
             db.session.commit()
             print("✅ DB upgrade ensured.")
     except Exception as e:
@@ -175,6 +182,25 @@ def send_to_ghl(result_data):
         log.exception("GHL error: %s", e)
         return False
 
+def fetch_website_text(url: str) -> str:
+    import re
+    try:
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        resp = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0 (compatible; RedditScraper/1.0)'})
+        resp.raise_for_status()
+        html = resp.text
+        # Strip script/style blocks
+        html = re.sub(r'<(script|style|nav|footer|header)[^>]*>.*?</(script|style|nav|footer|header)>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        # Strip remaining tags
+        text = re.sub(r'<[^>]+>', ' ', html)
+        # Collapse whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text[:10000]
+    except Exception as e:
+        log.warning("Website fetch error (%s): %s", url, e)
+        return ""
+
 def get_anthropic_client():
     return anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -185,12 +211,16 @@ def get_user_context(user_id: int) -> str:
     if profile:
         if profile.business_name:
             parts.append(f"Business Name: {profile.business_name}")
+        if profile.website_url:
+            parts.append(f"Website: {profile.website_url}")
         if profile.description:
             parts.append(f"Business Description: {profile.description}")
         if profile.services:
             parts.append(f"Services/Products: {profile.services}")
         if profile.tone:
             parts.append(f"Tone/Voice: {profile.tone}")
+        if profile.website_cache:
+            parts.append(f"--- Website Content ({profile.website_url}) ---\n{profile.website_cache}")
     for f in files:
         if f.extracted_text:
             parts.append(f"--- Knowledge File: {f.filename} ---\n{f.extracted_text[:4000]}")
@@ -1175,12 +1205,26 @@ def profile():
         if not prof:
             prof = UserProfile(user_id=user_id)
             db.session.add(prof)
+        prev_url = prof.website_url or ''
         prof.business_name = request.form.get('business_name', '')
         prof.description = request.form.get('description', '')
         prof.services = request.form.get('services', '')
         prof.tone = request.form.get('tone', '')
+        prof.website_url = request.form.get('website_url', '').strip()
         db.session.commit()
-        flash('Profile saved!')
+
+        # Re-fetch website if URL changed or cache is empty
+        if prof.website_url and (prof.website_url != prev_url or not prof.website_cache):
+            content = fetch_website_text(prof.website_url)
+            prof.website_cache = content
+            prof.website_cached_at = datetime.utcnow()
+            db.session.commit()
+            if content:
+                flash(f'Profile saved! Website fetched — {len(content):,} characters cached.')
+            else:
+                flash('Profile saved. Could not fetch website — check the URL.')
+        else:
+            flash('Profile saved!')
         return redirect(url_for('profile'))
 
     files = ProfileFile.query.filter_by(user_id=user_id).order_by(ProfileFile.created_at.desc()).all()
@@ -1223,6 +1267,14 @@ def profile():
                 placeholder="e.g. Professional, friendly, expert, casual"
                 value="{(prof.tone or '') if prof else ''}">
 
+              <label class="form-label"><b>Website URL</b></label>
+              <input class="form-control mb-1" name="website_url" type="url"
+                placeholder="https://yourbusiness.com"
+                value="{(prof.website_url or '') if prof else ''}">
+              <div class="mb-3 small muted">
+                {f'Last fetched: {prof.website_cached_at.strftime("%Y-%m-%d %H:%M")} UTC &nbsp;·&nbsp; <a href="/profile/refresh-website">Refresh now</a>' if (prof and prof.website_cached_at) else 'Content will be fetched when you save.'}
+              </div>
+
               <button class="btn btn-primary" type="submit">Save Profile</button>
             </form>
           </div>
@@ -1248,6 +1300,23 @@ def profile():
       </div>
     """
     return page_wrap(html, "Business Profile")
+
+@app.route('/profile/refresh-website')
+@login_required
+def profile_refresh_website():
+    prof = UserProfile.query.filter_by(user_id=session['user_id']).first()
+    if not prof or not prof.website_url:
+        flash('No website URL saved in your profile.')
+        return redirect(url_for('profile'))
+    content = fetch_website_text(prof.website_url)
+    prof.website_cache = content
+    prof.website_cached_at = datetime.utcnow()
+    db.session.commit()
+    if content:
+        flash(f'Website refreshed — {len(content):,} characters cached.')
+    else:
+        flash('Could not fetch website — check the URL.')
+    return redirect(url_for('profile'))
 
 @app.route('/profile/upload', methods=['POST'])
 @login_required
