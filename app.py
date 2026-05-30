@@ -111,6 +111,17 @@ def login_required(f):
         return f(*args, **kwargs)
     return inner
 
+def admin_required(f):
+    @wraps(f)
+    def inner(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        if not session.get('is_admin'):
+            flash('Admin access required')
+            return redirect(url_for('dashboard'))
+        return f(*args, **kwargs)
+    return inner
+
 def send_to_ghl(result_data):
     if not GHL_API_KEY or not GHL_LOCATION_ID:
         return False
@@ -338,6 +349,7 @@ def page_wrap(inner_html: str, page_title: str = "") -> str:
       <ul class="navbar-nav me-auto mb-2 mb-lg-0">
         <li class="nav-item"><a class="nav-link" style="color:var(--text)" href="/dashboard">Dashboard</a></li>
         <li class="nav-item"><a class="nav-link" style="color:var(--text)" href="/create-scrape">New Scrape</a></li>
+        {'<li class="nav-item"><a class="nav-link" style="color:var(--brand-primary)" href="/admin"><i class="bi bi-shield-lock"></i> Admin</a></li>' if session.get("is_admin") else ''}
       </ul>
       <a class="btn btn-sm btn-outline-light me-2" href="/theme/toggle"><i class="bi bi-moon-stars"></i> {toggle_label}</a>
       <span class="muted me-3">Hi, {session.get("username","guest")}</span>
@@ -506,6 +518,7 @@ def login():
         user = User.query.filter_by(username=u).first()
         if user and check_password_hash(user.password_hash, p):
             session['user_id'] = user.id; session['username'] = user.username
+            session['is_admin'] = user.is_admin
             return redirect(url_for('dashboard'))
         flash('Invalid credentials')
     html = '''
@@ -988,6 +1001,128 @@ def delete_scrape(scrape_id):
     db.session.delete(s); db.session.commit()
     flash('Scrape deleted')
     return redirect(url_for('dashboard'))
+
+# ------------ Admin ------------
+@app.route('/admin')
+@admin_required
+def admin_panel():
+    users = User.query.order_by(User.created_at.desc()).all()
+
+    rows = ""
+    for u in users:
+        total_scrapes = db.session.query(func.count(Scrape.id)).filter_by(user_id=u.id).scalar() or 0
+        active_scrapes = db.session.query(func.count(Scrape.id)).filter_by(user_id=u.id, is_active=True).scalar() or 0
+        total_results = db.session.query(func.count(Result.id))\
+            .join(Scrape, Result.scrape_id == Scrape.id)\
+            .filter(Scrape.user_id == u.id).scalar() or 0
+        admin_badge = '<span class="badge text-bg-warning">Admin</span>' if u.is_admin else ''
+        rows += f"""
+        <tr>
+          <td>{u.id}</td>
+          <td>{u.username} {admin_badge}</td>
+          <td>{u.email}</td>
+          <td>{u.created_at.strftime('%Y-%m-%d')}</td>
+          <td>{active_scrapes} / {total_scrapes}</td>
+          <td>{total_results}</td>
+          <td class="text-nowrap">
+            <a class="btn btn-sm btn-outline-primary" href="/admin/login-as/{u.id}">Login As</a>
+            {'<a class="btn btn-sm btn-outline-warning" href="/admin/toggle-admin/' + str(u.id) + '">Toggle Admin</a>' if u.id != session['user_id'] else ''}
+          </td>
+        </tr>
+        """
+
+    html = f"""
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <h2 class="mb-0">Admin Panel</h2>
+        <a class="btn btn-primary" href="/admin/create-user"><i class="bi bi-person-plus"></i> Add User</a>
+      </div>
+      <div class="card p-3">
+        <div class="table-responsive">
+          <table class="table table-sm align-middle">
+            <thead>
+              <tr>
+                <th>ID</th><th>Username</th><th>Email</th><th>Joined</th>
+                <th>Active / Total Scrapes</th><th>Total Results</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>{rows or '<tr><td colspan="7" class="text-center py-4">No users.</td></tr>'}</tbody>
+          </table>
+        </div>
+      </div>
+    """
+    return page_wrap(html, "Admin")
+
+@app.route('/admin/create-user', methods=['GET', 'POST'])
+@admin_required
+def admin_create_user():
+    if request.method == 'POST':
+        u = request.form['username'].strip()
+        e = request.form['email'].strip()
+        p = request.form['password']
+        is_admin = 'is_admin' in request.form
+        if User.query.filter_by(username=u).first():
+            flash('Username already exists')
+        elif User.query.filter_by(email=e).first():
+            flash('Email already exists')
+        else:
+            user = User(username=u, email=e, password_hash=generate_password_hash(p), is_admin=is_admin)
+            db.session.add(user); db.session.commit()
+            flash(f'User {u} created!')
+            return redirect(url_for('admin_panel'))
+
+    html = '''
+      <h2 class="mb-3">Create New User</h2>
+      <form method="POST" class="card card-body" style="max-width:520px">
+        <label class="form-label"><b>Username</b></label>
+        <input class="form-control mb-3" type="text" name="username" required>
+        <label class="form-label"><b>Email</b></label>
+        <input class="form-control mb-3" type="email" name="email" required>
+        <label class="form-label"><b>Password</b></label>
+        <input class="form-control mb-3" type="password" name="password" required>
+        <div class="form-check mb-3">
+          <input class="form-check-input" type="checkbox" name="is_admin" id="is_admin">
+          <label class="form-check-label" for="is_admin">Grant admin access</label>
+        </div>
+        <button class="btn btn-primary" type="submit">Create User</button>
+      </form>
+      <a class="d-inline-block mt-3" href="/admin">← Back to Admin</a>
+    '''
+    return page_wrap(html, "Create User")
+
+@app.route('/admin/login-as/<int:user_id>')
+@admin_required
+def admin_login_as(user_id):
+    user = User.query.get_or_404(user_id)
+    session['_admin_id'] = session['user_id']
+    session['_admin_username'] = session['username']
+    session['user_id'] = user.id
+    session['username'] = user.username
+    session['is_admin'] = False
+    flash(f'Viewing as {user.username}. <a href="/admin/return">Return to admin</a>')
+    return redirect(url_for('dashboard'))
+
+@app.route('/admin/return')
+@login_required
+def admin_return():
+    if '_admin_id' not in session:
+        return redirect(url_for('dashboard'))
+    session['user_id'] = session.pop('_admin_id')
+    session['username'] = session.pop('_admin_username')
+    session['is_admin'] = True
+    flash('Back to your admin account.')
+    return redirect(url_for('admin_panel'))
+
+@app.route('/admin/toggle-admin/<int:user_id>')
+@admin_required
+def admin_toggle_admin(user_id):
+    if user_id == session['user_id']:
+        flash('Cannot change your own admin status')
+        return redirect(url_for('admin_panel'))
+    user = User.query.get_or_404(user_id)
+    user.is_admin = not user.is_admin
+    db.session.commit()
+    flash(f'{user.username} is {"now" if user.is_admin else "no longer"} an admin.')
+    return redirect(url_for('admin_panel'))
 
 # ------------ Cron webhook (optional) ------------
 @app.route('/tasks/run-all', methods=['POST'])
