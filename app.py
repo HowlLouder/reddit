@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 from functools import wraps
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import text, func, case
-import praw, json, requests, os, logging
+import praw, json, requests, os, logging, io
+import anthropic as anthropic_sdk
 
 # ------------ Flask & DB ------------
 app = Flask(__name__)
@@ -23,8 +24,8 @@ log = logging.getLogger("reddit-leads")
 # ------------ Env Config ------------
 GHL_API_KEY      = os.environ.get('GHL_API_KEY', '')
 GHL_LOCATION_ID  = os.environ.get('GHL_LOCATION_ID', '')
-OPENAI_API_KEY   = os.environ.get('OPENAI_API_KEY', '')
-AI_MODEL         = os.environ.get('AI_MODEL', 'gpt-4o-mini')
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+AI_MODEL          = os.environ.get('AI_MODEL', 'claude-sonnet-4-6')
 AI_MIN_SCORE     = int(os.environ.get('AI_MIN_SCORE', '6'))
 ENABLE_DB_ADMIN  = os.environ.get('ENABLE_DB_ADMIN', '0') == '1'
 TASKS_TOKEN      = os.environ.get('TASKS_TOKEN', '')
@@ -49,8 +50,9 @@ class Scrape(db.Model):
     last_run = db.Column(db.DateTime)
     is_active = db.Column(db.Boolean, default=True)
     # Per-scrape AI configuration
-    ai_guidance = db.Column(db.Text)                     # optional guidance for AI
-    ai_enabled  = db.Column(db.Boolean, default=True)    # allow turning AI off per-scrape
+    ai_guidance = db.Column(db.Text)
+    ai_enabled  = db.Column(db.Boolean, default=True)
+    scrape_type = db.Column(db.String(20), default='lead')  # 'lead' or 'seo'
 
 class Result(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -69,6 +71,25 @@ class Result(db.Model):
     reddit_post_id = db.Column(db.String(50))
     # archive / hide
     is_hidden = db.Column(db.Boolean, default=False)
+    suggested_response = db.Column(db.Text)
+
+class UserProfile(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), unique=True, nullable=False)
+    business_name = db.Column(db.String(200))
+    description = db.Column(db.Text)
+    services = db.Column(db.Text)
+    tone = db.Column(db.String(200))
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class ProfileFile(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    filename = db.Column(db.String(255), nullable=False)
+    extracted_text = db.Column(db.Text)
+    storage_url = db.Column(db.Text)  # reserved for future S3/object storage
+    file_size = db.Column(db.Integer)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 # --- Auto-migration: ensure columns/indexes exist (runs at import) ---
 def ensure_db_upgrade():
@@ -87,6 +108,10 @@ def ensure_db_upgrade():
             db.session.execute(text("ALTER TABLE scrape ADD COLUMN IF NOT EXISTS ai_guidance TEXT;"))
             db.session.execute(text("ALTER TABLE scrape ADD COLUMN IF NOT EXISTS ai_enabled BOOLEAN;"))
             db.session.execute(text("UPDATE scrape SET ai_enabled = TRUE WHERE ai_enabled IS NULL;"))
+            db.session.execute(text("ALTER TABLE scrape ADD COLUMN IF NOT EXISTS scrape_type VARCHAR(20);"))
+            db.session.execute(text("UPDATE scrape SET scrape_type = 'lead' WHERE scrape_type IS NULL;"))
+            # result table - new columns
+            db.session.execute(text("ALTER TABLE result ADD COLUMN IF NOT EXISTS suggested_response TEXT;"))
             db.session.commit()
             print("✅ DB upgrade ensured.")
     except Exception as e:
@@ -150,54 +175,124 @@ def send_to_ghl(result_data):
         log.exception("GHL error: %s", e)
         return False
 
-def ai_score_post(title: str, body: str, keywords: list[str], guidance: str | None = None) -> tuple[int, str]:
-    """Return (score, reason). If unavailable, (0, 'AI unavailable')."""
-    if not OPENAI_API_KEY:
-        return 0, "AI disabled (missing OPENAI_API_KEY)"
+def get_anthropic_client():
+    return anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+def get_user_context(user_id: int) -> str:
+    profile = UserProfile.query.filter_by(user_id=user_id).first()
+    files = ProfileFile.query.filter_by(user_id=user_id).all()
+    parts = []
+    if profile:
+        if profile.business_name:
+            parts.append(f"Business Name: {profile.business_name}")
+        if profile.description:
+            parts.append(f"Business Description: {profile.description}")
+        if profile.services:
+            parts.append(f"Services/Products: {profile.services}")
+        if profile.tone:
+            parts.append(f"Tone/Voice: {profile.tone}")
+    for f in files:
+        if f.extracted_text:
+            parts.append(f"--- Knowledge File: {f.filename} ---\n{f.extracted_text[:4000]}")
+    return "\n\n".join(parts)
+
+def ai_score_post(title: str, body: str, keywords: list[str], guidance: str | None = None,
+                  scrape_type: str = 'lead', user_context: str = '') -> tuple[int, str]:
+    if not ANTHROPIC_API_KEY:
+        return 0, "AI disabled (missing ANTHROPIC_API_KEY)"
     try:
         guidance_text = (guidance or "").strip()
-        prompt = f"""
-You are scoring Reddit posts for lead intent. A high-quality lead means the author is asking for help, hiring, seeking services, requesting recommendations, or describing a solvable pain where outreach is welcome.
+        context_block = f"\n\nBUSINESS CONTEXT:\n{user_context}" if user_context else ""
 
-If GUIDANCE is provided, bias your judgment toward that use-case and weigh relevance accordingly.
-
-GUIDANCE (optional):
-{guidance_text if guidance_text else "(none)"}
-
-Score from 1-10:
+        if scrape_type == 'seo':
+            system_prompt = "You are a concise SEO opportunity analyst for Reddit content marketing."
+            scoring_guide = """Score this Reddit post as an SEO/content marketing opportunity (1-10):
+- 9-10: High-traffic question in your niche, perfect for an authoritative helpful reply that builds brand visibility
+- 7-8: Good opportunity — relevant topic, engaged audience, room to add genuine value
+- 4-6: Marginal — loosely related or low engagement
+- 1-3: Not an opportunity (wrong topic, rant, already resolved, too niche)"""
+        else:
+            system_prompt = "You are a concise lead-qualification assistant."
+            scoring_guide = """Score this Reddit post for lead intent (1-10):
 - 9-10: Direct ask for help/hiring in scope
 - 7-8: Strong buying signals or urgent pain in scope
 - 4-6: Vague interest/learning; maybe relevant but weak
-- 1-3: Not a lead or out-of-scope
+- 1-3: Not a lead or out-of-scope"""
 
-Return STRICT JSON with fields: score (int 1-10), reason (<= 240 chars). No extra text.
+        prompt = f"""{scoring_guide}
+
+If GUIDANCE is provided, bias your judgment toward that use-case.{context_block}
+
+GUIDANCE: {guidance_text if guidance_text else "(none)"}
+
+Return STRICT JSON: {{"score": int 1-10, "reason": string <= 240 chars}}. No extra text.
 
 Title: {title}
 Body: {(body or '')[:1500]}
-Matched keywords: {", ".join(keywords)}
-        """.strip()
+Matched keywords: {", ".join(keywords)}"""
 
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-        payload = {
-            "model": AI_MODEL,
-            "messages": [
-                {"role": "system", "content": "You are a concise lead-qualification assistant."},
-                {"role": "user",   "content": prompt},
-            ],
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"}
-        }
-        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=20)
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
+        client = get_anthropic_client()
+        msg = client.messages.create(
+            model=AI_MODEL,
+            max_tokens=256,
+            system=system_prompt,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        content = msg.content[0].text.strip()
         j = json.loads(content)
-        score = int(j.get("score", 0))
+        score = max(1, min(10, int(j.get("score", 0))))
         reason = str(j.get("reason", ""))[:1000]
-        score = max(1, min(10, score))
         return score, reason
     except Exception as e:
         log.warning("AI scoring error: %s", e)
         return 0, "AI unavailable"
+
+def generate_suggested_response(title: str, body: str, subreddit: str,
+                                 scrape_type: str = 'lead', user_context: str = '') -> str:
+    if not ANTHROPIC_API_KEY:
+        return ""
+    try:
+        context_block = f"\n\nYOUR BUSINESS CONTEXT:\n{user_context}" if user_context else ""
+        if scrape_type == 'seo':
+            instruction = "Write a helpful, genuine Reddit reply that adds real value to the thread and naturally (not forcefully) showcases your expertise. Be conversational, not salesy. Max 150 words."
+        else:
+            instruction = "Write a friendly, helpful Reddit reply that addresses the poster's need and naturally introduces how your business could help. Be genuine, not pushy. Max 150 words."
+
+        prompt = f"""{instruction}{context_block}
+
+Subreddit: r/{subreddit}
+Post title: {title}
+Post body: {(body or '')[:1000]}
+
+Write only the reply text, nothing else."""
+
+        client = get_anthropic_client()
+        msg = client.messages.create(
+            model=AI_MODEL,
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        log.warning("Response generation error: %s", e)
+        return ""
+
+def extract_file_text(filename: str, file_bytes: bytes) -> str:
+    ext = filename.rsplit('.', 1)[-1].lower()
+    try:
+        if ext == 'txt':
+            return file_bytes.decode('utf-8', errors='ignore')
+        elif ext == 'pdf':
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(file_bytes))
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
+        elif ext in ('docx', 'doc'):
+            from docx import Document
+            doc = Document(io.BytesIO(file_bytes))
+            return "\n".join(p.text for p in doc.paragraphs)
+    except Exception as e:
+        log.warning("File extraction error (%s): %s", filename, e)
+    return ""
 
 def badge_for_status(is_active: bool) -> str:
     return '<span class="badge text-bg-success">Active</span>' if is_active else '<span class="badge text-bg-secondary">Paused</span>'
@@ -349,6 +444,7 @@ def page_wrap(inner_html: str, page_title: str = "") -> str:
       <ul class="navbar-nav me-auto mb-2 mb-lg-0">
         <li class="nav-item"><a class="nav-link" style="color:var(--text)" href="/dashboard">Dashboard</a></li>
         <li class="nav-item"><a class="nav-link" style="color:var(--text)" href="/create-scrape">New Scrape</a></li>
+        <li class="nav-item"><a class="nav-link" style="color:var(--text)" href="/profile"><i class="bi bi-building"></i> Profile</a></li>
         {'<li class="nav-item"><a class="nav-link" style="color:var(--brand-primary)" href="/admin"><i class="bi bi-shield-lock"></i> Admin</a></li>' if session.get("is_admin") else ''}
       </ul>
       <a class="btn btn-sm btn-outline-light me-2" href="/theme/toggle"><i class="bi bi-moon-stars"></i> {toggle_label}</a>
@@ -382,6 +478,8 @@ def run_scrape(scrape_id):
             subreddit_list = [s.strip() for s in scrape.subreddits.split(',') if s.strip()]
             keyword_list  = [k.strip().lower() for k in scrape.keywords.split(',') if k.strip()]
 
+            stype = scrape.scrape_type or 'lead'
+            user_context = get_user_context(scrape.user_id)
             results_count = 0
             for subreddit_name in subreddit_list:
                 try:
@@ -400,11 +498,21 @@ def run_scrape(scrape_id):
                         if Result.query.filter_by(scrape_id=scrape.id, reddit_post_id=post_id).first():
                             continue
 
-                        # --- AI scoring (optional) ---
                         if scrape.ai_enabled:
-                            ai_score_val, ai_reason = ai_score_post(title, body, found, guidance=scrape.ai_guidance)
+                            ai_score_val, ai_reason = ai_score_post(
+                                title, body, found,
+                                guidance=scrape.ai_guidance,
+                                scrape_type=stype,
+                                user_context=user_context
+                            )
+                            suggested = generate_suggested_response(
+                                title, body, subreddit_name,
+                                scrape_type=stype,
+                                user_context=user_context
+                            )
                         else:
                             ai_score_val, ai_reason = None, "AI disabled for this scrape"
+                            suggested = ""
 
                         result = Result(
                             scrape_id=scrape.id,
@@ -417,12 +525,12 @@ def run_scrape(scrape_id):
                             ai_score=ai_score_val,
                             ai_reasoning=ai_reason,
                             reddit_post_id=post_id,
-                            is_hidden=False
+                            is_hidden=False,
+                            suggested_response=suggested
                         )
                         db.session.add(result)
                         results_count += 1
 
-                        # Auto-send only when AI is ON and meets threshold
                         if scrape.ai_enabled and (ai_score_val or 0) >= AI_MIN_SCORE:
                             send_to_ghl({
                                 'author': str(post.author),
@@ -716,7 +824,8 @@ def create_scrape():
             limit=int(request.form.get('limit', 50)),
             user_id=session['user_id'],
             ai_guidance=request.form.get('ai_guidance', ''),
-            ai_enabled=(request.form.get('ai_enabled', 'on') == 'on')  # checked by default
+            ai_enabled=(request.form.get('ai_enabled', 'on') == 'on'),
+            scrape_type=request.form.get('scrape_type', 'lead')
         )
         db.session.add(scrape); db.session.commit()
         flash('Scrape created! It will run automatically every hour.')
@@ -727,6 +836,12 @@ def create_scrape():
       <form method="POST" class="card card-body" style="max-width:720px">
         <label class="form-label"><b>Name</b></label>
         <input class="form-control mb-3" type="text" name="name" required>
+
+        <label class="form-label"><b>Scrape Type</b></label>
+        <select class="form-select mb-3" name="scrape_type">
+          <option value="lead">Lead Generation — find people who need your services</option>
+          <option value="seo">SEO Opportunity — find threads to engage and build authority</option>
+        </select>
 
         <label class="form-label"><b>Subreddits (comma-separated)</b></label>
         <input class="form-control mb-3" type="text" name="subreddits" placeholder="bookkeeping,smallbusiness,accounting" required>
@@ -766,16 +881,24 @@ def edit_scrape(scrape_id):
         s.limit = int(request.form.get('limit', s.limit or 50))
         s.ai_guidance = request.form.get('ai_guidance', '')
         s.ai_enabled = (request.form.get('ai_enabled') == 'on')
+        s.scrape_type = request.form.get('scrape_type', 'lead')
         db.session.commit()
         flash('Scrape updated.')
         return redirect(url_for('dashboard'))
 
     checked = 'checked' if (s.ai_enabled is None or s.ai_enabled) else ''
+    stype = s.scrape_type or 'lead'
     html = f'''
       <h2 class="mb-3">Edit Scrape</h2>
       <form method="POST" class="card card-body" style="max-width:720px">
         <label class="form-label"><b>Name</b></label>
         <input class="form-control mb-3" type="text" name="name" value="{s.name}" required>
+
+        <label class="form-label"><b>Scrape Type</b></label>
+        <select class="form-select mb-3" name="scrape_type">
+          <option value="lead" {"selected" if stype=="lead" else ""}>Lead Generation — find people who need your services</option>
+          <option value="seo" {"selected" if stype=="seo" else ""}>SEO Opportunity — find threads to engage and build authority</option>
+        </select>
 
         <label class="form-label"><b>Subreddits (comma-separated)</b></label>
         <input class="form-control mb-3" type="text" name="subreddits" value="{s.subreddits}" required>
@@ -886,6 +1009,24 @@ def view_results(scrape_id):
             actions.append(f'<a class="btn btn-sm btn-outline-danger" href="/result/{r.id}/hide?min_score={min_score}&show_hidden={1 if show_hidden else 0}">Hide</a>')
 
         hidden_tag = '<span class="badge text-bg-secondary ms-2">Hidden</span>' if r.is_hidden else ''
+        response_html = ""
+        if r.suggested_response:
+            safe_response = r.suggested_response.replace('`', '&#96;').replace('"', '&quot;')
+            response_html = f'''
+              <tr class="{'opacity-50' if r.is_hidden else ''}">
+                <td colspan="8" style="background:var(--table-head); padding:12px 16px;">
+                  <div class="d-flex justify-content-between align-items-start gap-2">
+                    <div>
+                      <span class="badge text-bg-success me-2"><i class="bi bi-chat-dots"></i> Suggested Reply</span>
+                      <span style="white-space:pre-wrap">{r.suggested_response}</span>
+                    </div>
+                    <button class="btn btn-sm btn-outline-secondary flex-shrink-0"
+                      onclick="navigator.clipboard.writeText(`{safe_response}`)" title="Copy">
+                      <i class="bi bi-clipboard"></i>
+                    </button>
+                  </div>
+                </td>
+              </tr>'''
         rows += f'''
           <tr class="{'opacity-50' if r.is_hidden else ''}">
             <td>{r.created_at.strftime('%Y-%m-%d %H:%M')}</td>
@@ -897,6 +1038,7 @@ def view_results(scrape_id):
             <td>{ai_html}</td>
             <td class="text-nowrap">{' '.join(actions)}</td>
           </tr>
+          {response_html}
         '''
 
     if not results:
@@ -1001,6 +1143,132 @@ def delete_scrape(scrape_id):
     db.session.delete(s); db.session.commit()
     flash('Scrape deleted')
     return redirect(url_for('dashboard'))
+
+# ------------ Business Profile ------------
+@app.route('/profile', methods=['GET', 'POST'])
+@login_required
+def profile():
+    user_id = session['user_id']
+    prof = UserProfile.query.filter_by(user_id=user_id).first()
+
+    if request.method == 'POST':
+        if not prof:
+            prof = UserProfile(user_id=user_id)
+            db.session.add(prof)
+        prof.business_name = request.form.get('business_name', '')
+        prof.description = request.form.get('description', '')
+        prof.services = request.form.get('services', '')
+        prof.tone = request.form.get('tone', '')
+        db.session.commit()
+        flash('Profile saved!')
+        return redirect(url_for('profile'))
+
+    files = ProfileFile.query.filter_by(user_id=user_id).order_by(ProfileFile.created_at.desc()).all()
+
+    file_rows = ""
+    for f in files:
+        size_kb = round((f.file_size or 0) / 1024, 1)
+        chars = len(f.extracted_text or "")
+        file_rows += f"""
+        <tr>
+          <td><i class="bi bi-file-earmark-text me-2"></i>{f.filename}</td>
+          <td>{size_kb} KB</td>
+          <td>{chars:,} chars extracted</td>
+          <td>{f.created_at.strftime('%Y-%m-%d')}</td>
+          <td><a class="btn btn-sm btn-outline-danger" href="/profile/file/{f.id}/delete"
+               onclick="return confirm('Delete this file?')">Delete</a></td>
+        </tr>"""
+
+    html = f"""
+      <h2 class="mb-1">Business Profile</h2>
+      <p class="muted mb-4">This information is injected into every AI scoring and response generation call.</p>
+      <div class="row g-4">
+        <div class="col-lg-6">
+          <div class="card p-4">
+            <h5 class="mb-3">Business Info</h5>
+            <form method="POST">
+              <label class="form-label"><b>Business Name</b></label>
+              <input class="form-control mb-3" name="business_name" value="{(prof.business_name or '') if prof else ''}">
+
+              <label class="form-label"><b>Description</b></label>
+              <textarea class="form-control mb-3" name="description" rows="4"
+                placeholder="What does your business do? Who do you serve?">{(prof.description or '') if prof else ''}</textarea>
+
+              <label class="form-label"><b>Services / Products</b></label>
+              <textarea class="form-control mb-3" name="services" rows="3"
+                placeholder="List your main services or products">{(prof.services or '') if prof else ''}</textarea>
+
+              <label class="form-label"><b>Tone / Voice</b></label>
+              <input class="form-control mb-3" name="tone"
+                placeholder="e.g. Professional, friendly, expert, casual"
+                value="{(prof.tone or '') if prof else ''}">
+
+              <button class="btn btn-primary" type="submit">Save Profile</button>
+            </form>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="card p-4">
+            <h5 class="mb-3">Knowledge Files</h5>
+            <p class="muted small">Upload PDFs, Word docs, or text files. Content is extracted and used as context for AI.</p>
+            <form method="POST" action="/profile/upload" enctype="multipart/form-data" class="mb-3">
+              <input class="form-control mb-2" type="file" name="file" accept=".pdf,.docx,.txt" required>
+              <button class="btn btn-outline-primary btn-sm" type="submit">
+                <i class="bi bi-upload"></i> Upload File
+              </button>
+            </form>
+            <div class="table-responsive">
+              <table class="table table-sm align-middle">
+                <thead><tr><th>File</th><th>Size</th><th>Content</th><th>Added</th><th></th></tr></thead>
+                <tbody>{file_rows or '<tr><td colspan="5" class="text-center py-3 muted">No files uploaded yet.</td></tr>'}</tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    """
+    return page_wrap(html, "Business Profile")
+
+@app.route('/profile/upload', methods=['POST'])
+@login_required
+def profile_upload():
+    user_id = session['user_id']
+    f = request.files.get('file')
+    if not f or not f.filename:
+        flash('No file selected')
+        return redirect(url_for('profile'))
+
+    filename = f.filename
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+    if ext not in ('pdf', 'docx', 'doc', 'txt'):
+        flash('Unsupported file type. Use PDF, DOCX, or TXT.')
+        return redirect(url_for('profile'))
+
+    file_bytes = f.read()
+    extracted = extract_file_text(filename, file_bytes)
+
+    pf = ProfileFile(
+        user_id=user_id,
+        filename=filename,
+        extracted_text=extracted,
+        file_size=len(file_bytes)
+    )
+    db.session.add(pf)
+    db.session.commit()
+    flash(f'"{filename}" uploaded — {len(extracted):,} characters extracted.')
+    return redirect(url_for('profile'))
+
+@app.route('/profile/file/<int:file_id>/delete')
+@login_required
+def profile_file_delete(file_id):
+    pf = ProfileFile.query.get_or_404(file_id)
+    if pf.user_id != session['user_id']:
+        flash('Access denied')
+        return redirect(url_for('profile'))
+    db.session.delete(pf)
+    db.session.commit()
+    flash('File deleted.')
+    return redirect(url_for('profile'))
 
 # ------------ Admin ------------
 @app.route('/admin')
