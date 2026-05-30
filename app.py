@@ -419,6 +419,26 @@ BOOTSTRAP_SHELL = """
     border-color: var(--btn-outline);
     color: var(--btn-outline);
   }
+
+  /* Form controls respect theme */
+  .form-control, .form-select {
+    background-color: var(--panel);
+    color: var(--text);
+    border-color: var(--border);
+  }
+  .form-control:focus, .form-select:focus {
+    background-color: var(--panel);
+    color: var(--text);
+    border-color: var(--brand-primary);
+    box-shadow: 0 0 0 0.2rem rgba(255,176,0,.25);
+  }
+  .form-control::placeholder { color: var(--muted); }
+  .form-label { color: var(--text); }
+  .form-check-label { color: var(--text); }
+  .form-check-input {
+    background-color: var(--panel);
+    border-color: var(--border);
+  }
 </style>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" defer></script>
